@@ -14,3 +14,5 @@ dependencyResolutionManagement {
         google()
     }
 }
+
+include(":sdks:kotlin")
