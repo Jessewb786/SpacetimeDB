@@ -38,6 +38,7 @@ pub enum ReceiverLanguage<'a> {
     TypeScript,
     Csharp { namespace: &'a str },
     Cpp,
+    Kotlin { package_name: &'a str },
 }
 
 /// Generate receiver binding files without reading or writing the filesystem.
@@ -59,6 +60,11 @@ pub fn generate_receiver_bindings(
             // TODO(idc-cpp): Generate C++ receiver types and reducer handles with the required headers.
             anyhow::bail!("C++ receiver binding generation is not implemented yet")
         }
+        ReceiverLanguage::Kotlin { package_name } => Ok(generate(
+            module,
+            &Kotlin { package_name },
+            &CodegenOptions::default(),
+        )),
     }
 }
 
