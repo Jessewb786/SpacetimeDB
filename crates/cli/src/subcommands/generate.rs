@@ -7,7 +7,7 @@ use clap::ArgAction::{Set, SetTrue};
 use fs_err as fs;
 use spacetimedb_codegen::{
     generate, generate_receiver_bindings, private_table_names, CodegenOptions, CodegenVisibility, Csharp,
-    ImportExtension, Lang, OutputFile, ReceiverLanguage, Rust, TypeScript, UnrealCpp, AUTO_GENERATED_PREFIX,
+    ImportExtension, Kotlin, Lang, OutputFile, ReceiverLanguage, Rust, TypeScript, UnrealCpp, AUTO_GENERATED_PREFIX,
 };
 use spacetimedb_lib::de::serde::DeserializeWrapper;
 use spacetimedb_lib::RawModuleDef;
@@ -816,6 +816,7 @@ pub async fn run_prepared_generate_configs(
             let csharp_lang;
             let unreal_cpp_lang;
             let typescript_lang;
+            let kotlin_lang;
             let gen_lang = match run.lang {
                 Language::Csharp => {
                     csharp_lang = Csharp {
@@ -842,7 +843,13 @@ pub async fn run_prepared_generate_configs(
                     anyhow::bail!("C++ client bindings are not supported; use --lang unrealcpp for Unreal")
                 }
                 Language::Kotlin => {
-                    anyhow::bail!("Kotlin is a module binding target; use the default --bindings module")
+                    let pkg = if namespace_from_cli {
+                        &run.namespace
+                    } else {
+                        "spacetimedb"
+                    };
+                    kotlin_lang = Kotlin { package_name: pkg };
+                    &kotlin_lang as &dyn Lang
                 }
             };
             generate(&module, gen_lang, &options)
