@@ -1,4 +1,4 @@
-rootProject.name = "spacetimedb-sdk"
+rootProject.name = "kotlin"
 
 pluginManagement {
     repositories {
@@ -14,3 +14,6 @@ dependencyResolutionManagement {
         google()
     }
 }
+
+include(":spacetimedb-gradle-plugin")
+include(":spacetimedb-sdk")

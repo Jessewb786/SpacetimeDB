@@ -148,10 +148,10 @@ conn.unsubscribeAll()                                   // unsubscribe everythin
 
 ### Reducers & Procedures
 
-- `conn.reducers.myReducer(MyReducerArgs(...))` — typed reducer call
-- `conn.callReducer(name, args, callback?)` — raw reducer call
-- `conn.procedures.myProcedure(MyProcedureArgs(...)) { result -> ... }` — typed procedure call
-- `conn.callProcedure(name, args, callback?)` — raw procedure call
+- `conn.reducers.myReducer(MyReducerArgs(...))` — typed reducer call (suspend, returns `ReducerResult`)
+- `conn.callReducer(name, args)` — raw reducer call (suspend, returns `ReducerResult`)
+- `conn.procedures.myProcedure(MyProcedureArgs(...))` — typed procedure call (suspend, returns `ProcedureResult`)
+- `conn.callProcedure(name, args)` — raw procedure call (suspend, returns `ProcedureResult`)
 
 ## Documentation
 

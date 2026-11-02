@@ -67,8 +67,8 @@ class DbConnection internal constructor(
     private val tableHandles = mutableMapOf<String, TableHandle>()
     private val subscriptions = mutableMapOf<UInt, SubscriptionHandle>()
     private val subscriptionsByQuerySet = mutableMapOf<QuerySetId, SubscriptionHandle>()
-    private val reducerCallbacks = mutableMapOf<UInt, (ReducerResult) -> Unit>()
-    private val procedureCallbacks = mutableMapOf<UInt, (ProcedureResult) -> Unit>()
+    private val pendingReducers = mutableMapOf<UInt, CompletableDeferred<ReducerResult>>()
+    private val pendingProcedures = mutableMapOf<UInt, CompletableDeferred<ProcedureResult>>()
     private val pendingOneOffQueries = mutableMapOf<UInt, CompletableDeferred<ServerMessage.OneOffQueryResult>>()
 
     override var identity: Identity? = null
@@ -121,13 +121,11 @@ class DbConnection internal constructor(
     /** Creates a [SubscriptionBuilder] for subscribing to SQL queries on this connection. */
     override fun subscriptionBuilder(): SubscriptionBuilder = SubscriptionBuilder(this)
 
-    /** Invokes a server-side reducer by name with BSATN-encoded [args]. Optionally receives the [ReducerResult]. */
-    fun callReducer(reducerName: String, args: ByteArray, callback: ((ReducerResult) -> Unit)? = null) {
+    /** Invokes a server-side reducer by name with BSATN-encoded [args] and suspends until the result arrives. */
+    suspend fun callReducer(reducerName: String, args: ByteArray = ByteArray(0)): ReducerResult {
         val reqId = nextRequestId()
-        if (callback != null) {
-            // Register synchronously before sending to avoid race with server response
-            reducerCallbacks[reqId] = callback
-        }
+        val deferred = CompletableDeferred<ReducerResult>()
+        pendingReducers[reqId] = deferred
         transport.send(
             ClientMessage.CallReducer(
                 requestId = reqId,
@@ -135,14 +133,14 @@ class DbConnection internal constructor(
                 args = args,
             )
         )
+        return deferred.await()
     }
 
-    /** Invokes a server-side procedure by name with BSATN-encoded [args]. Optionally receives the [ProcedureResult]. */
-    fun callProcedure(procedureName: String, args: ByteArray, callback: ((ProcedureResult) -> Unit)? = null) {
+    /** Invokes a server-side procedure by name with BSATN-encoded [args] and suspends until the result arrives. */
+    suspend fun callProcedure(procedureName: String, args: ByteArray = ByteArray(0)): ProcedureResult {
         val reqId = nextRequestId()
-        if (callback != null) {
-            procedureCallbacks[reqId] = callback
-        }
+        val deferred = CompletableDeferred<ProcedureResult>()
+        pendingProcedures[reqId] = deferred
         transport.send(
             ClientMessage.CallProcedure(
                 requestId = reqId,
@@ -150,6 +148,7 @@ class DbConnection internal constructor(
                 args = args,
             )
         )
+        return deferred.await()
     }
 
     /** Executes a one-off SQL query against the module and suspends until the result arrives. */
@@ -250,8 +249,10 @@ class DbConnection internal constructor(
         val error = CancellationException("Connection closed")
         pendingOneOffQueries.values.forEach { it.cancel(error) }
         pendingOneOffQueries.clear()
-        reducerCallbacks.clear()
-        procedureCallbacks.clear()
+        pendingReducers.values.forEach { it.cancel(error) }
+        pendingReducers.clear()
+        pendingProcedures.values.forEach { it.cancel(error) }
+        pendingProcedures.clear()
     }
 
     private suspend fun handleMessage(msg: ServerMessage) {
@@ -318,13 +319,13 @@ class DbConnection internal constructor(
                         val ops = clientCache.applyTransactionUpdate(txUpdate.querySets)
                         fireTableCallbacks(ops)
                     }
-                    reducerCallbacks.remove(msg.requestId)?.invoke(
+                    pendingReducers.remove(msg.requestId)?.complete(
                         ReducerResult(msg.requestId, msg.timestamp, msg.result)
                     )
                 }
 
                 is ServerMessage.ProcedureResult -> {
-                    procedureCallbacks.remove(msg.requestId)?.invoke(
+                    pendingProcedures.remove(msg.requestId)?.complete(
                         ProcedureResult(msg.requestId, msg.timestamp, msg.status)
                     )
                 }

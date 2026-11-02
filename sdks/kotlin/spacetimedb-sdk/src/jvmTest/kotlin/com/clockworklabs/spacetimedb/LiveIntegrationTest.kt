@@ -2,10 +2,7 @@ package com.clockworklabs.spacetimedb
 
 import com.clockworklabs.spacetimedb.bsatn.BsatnWriter
 import com.clockworklabs.spacetimedb.websocket.ConnectionState
-import kotlinx.coroutines.CompletableDeferred
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.*
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
@@ -112,7 +109,6 @@ class LiveIntegrationTest {
             val connected = CompletableDeferred<Unit>()
             val subApplied = CompletableDeferred<Unit>()
             val insertReceived = CompletableDeferred<ByteArray>()
-            val reducerResult = CompletableDeferred<ReducerResult>()
 
             val conn = DbConnection.builder()
                 .withUri(serverUri)
@@ -143,14 +139,13 @@ class LiveIntegrationTest {
             argsWriter.writeString(name)
             argsWriter.writeU8(25u)
 
-            conn.callReducer("add", argsWriter.toByteArray()) { result ->
-                reducerResult.complete(result)
+            val result = withTimeout(5000.milliseconds) {
+                conn.callReducer("add", argsWriter.toByteArray())
             }
 
             val row = withTimeout(5000.milliseconds) { insertReceived.await() }
             assertTrue(row.isNotEmpty(), "Should receive inserted row bytes")
 
-            val result = withTimeout(5000.milliseconds) { reducerResult.await() }
             assertNotNull(result, "Should receive reducer result")
 
             println("PASS: Called add('$name', 25)")
@@ -190,16 +185,20 @@ class LiveIntegrationTest {
             withTimeout(5000.milliseconds) { connected.await() }
             withTimeout(5000.milliseconds) { subApplied.await() }
 
-            // Fire N reducer calls and measure round-trip time
+            // Fire N reducer calls concurrently and measure round-trip time
             val elapsed = measureTime {
-                repeat(targetCount) { i ->
-                    val w = BsatnWriter(64)
-                    w.writeString("Batch_${System.currentTimeMillis()}_$i")
-                    w.writeU8(25u)
-                    conn.callReducer("add", w.toByteArray())
+                coroutineScope {
+                    repeat(targetCount) { i ->
+                        launch {
+                            val w = BsatnWriter(64)
+                            w.writeString("Batch_${System.currentTimeMillis()}_$i")
+                            w.writeU8(25u)
+                            conn.callReducer("add", w.toByteArray())
+                        }
+                    }
                 }
 
-                // Wait for all inserts to arrive
+                // Wait for all inserts to arrive (safety margin after all reducers complete)
                 withTimeout(15000.milliseconds) {
                     while (insertCount.get() < targetCount) {
                         delay(50.milliseconds)

@@ -32,25 +32,25 @@ class RemoteTables(private val conn: DbConnection) {
 
 class RemoteReducers(val conn: DbConnection) {
     internal var onUnhandledReducerError: ((ReducerEventContext, Exception) -> Unit)? = null
-    fun add(args: AddArgs, callback: ((ReducerResult) -> Unit)? = null) = addReducer(conn, args, callback)
-    fun addPlayer(args: AddPlayerArgs, callback: ((ReducerResult) -> Unit)? = null) = addPlayerReducer(conn, args, callback)
-    fun addPrivate(args: AddPrivateArgs, callback: ((ReducerResult) -> Unit)? = null) = addPrivateReducer(conn, args, callback)
-    fun assertCallerIdentityIsModuleIdentity(args: AssertCallerIdentityIsModuleIdentityArgs, callback: ((ReducerResult) -> Unit)? = null) = assertCallerIdentityIsModuleIdentityReducer(conn, args, callback)
-    fun deletePlayer(args: DeletePlayerArgs, callback: ((ReducerResult) -> Unit)? = null) = deletePlayerReducer(conn, args, callback)
-    fun deletePlayersByName(args: DeletePlayersByNameArgs, callback: ((ReducerResult) -> Unit)? = null) = deletePlayersByNameReducer(conn, args, callback)
-    fun listOverAge(args: ListOverAgeArgs, callback: ((ReducerResult) -> Unit)? = null) = listOverAgeReducer(conn, args, callback)
-    fun logModuleIdentity(args: LogModuleIdentityArgs, callback: ((ReducerResult) -> Unit)? = null) = logModuleIdentityReducer(conn, args, callback)
-    fun queryPrivate(args: QueryPrivateArgs, callback: ((ReducerResult) -> Unit)? = null) = queryPrivateReducer(conn, args, callback)
-    fun sayHello(args: SayHelloArgs, callback: ((ReducerResult) -> Unit)? = null) = sayHelloReducer(conn, args, callback)
-    fun test(args: TestArgs, callback: ((ReducerResult) -> Unit)? = null) = testReducer(conn, args, callback)
-    fun testBtreeIndexArgs(args: TestBtreeIndexArgsArgs, callback: ((ReducerResult) -> Unit)? = null) = testBtreeIndexArgsReducer(conn, args, callback)
+    suspend fun add(args: AddArgs): ReducerResult = addReducer(conn, args)
+    suspend fun addPlayer(args: AddPlayerArgs): ReducerResult = addPlayerReducer(conn, args)
+    suspend fun addPrivate(args: AddPrivateArgs): ReducerResult = addPrivateReducer(conn, args)
+    suspend fun assertCallerIdentityIsModuleIdentity(args: AssertCallerIdentityIsModuleIdentityArgs): ReducerResult = assertCallerIdentityIsModuleIdentityReducer(conn, args)
+    suspend fun deletePlayer(args: DeletePlayerArgs): ReducerResult = deletePlayerReducer(conn, args)
+    suspend fun deletePlayersByName(args: DeletePlayersByNameArgs): ReducerResult = deletePlayersByNameReducer(conn, args)
+    suspend fun listOverAge(args: ListOverAgeArgs): ReducerResult = listOverAgeReducer(conn, args)
+    suspend fun logModuleIdentity(args: LogModuleIdentityArgs): ReducerResult = logModuleIdentityReducer(conn, args)
+    suspend fun queryPrivate(args: QueryPrivateArgs): ReducerResult = queryPrivateReducer(conn, args)
+    suspend fun sayHello(args: SayHelloArgs): ReducerResult = sayHelloReducer(conn, args)
+    suspend fun test(args: TestArgs): ReducerResult = testReducer(conn, args)
+    suspend fun testBtreeIndexArgs(args: TestBtreeIndexArgsArgs): ReducerResult = testBtreeIndexArgsReducer(conn, args)
 }
 
 class RemoteProcedures(val conn: DbConnection) {
-    fun getMySchemaViaHttp(args: GetMySchemaViaHttpArgs, callback: ((ProcedureResult) -> Unit)? = null) = getMySchemaViaHttpProcedure(conn, args, callback)
-    fun returnValue(args: ReturnValueArgs, callback: ((ProcedureResult) -> Unit)? = null) = returnValueProcedure(conn, args, callback)
-    fun sleepOneSecond(args: SleepOneSecondArgs, callback: ((ProcedureResult) -> Unit)? = null) = sleepOneSecondProcedure(conn, args, callback)
-    fun withTx(args: WithTxArgs, callback: ((ProcedureResult) -> Unit)? = null) = withTxProcedure(conn, args, callback)
+    suspend fun getMySchemaViaHttp(args: GetMySchemaViaHttpArgs): ProcedureResult = getMySchemaViaHttpProcedure(conn, args)
+    suspend fun returnValue(args: ReturnValueArgs): ProcedureResult = returnValueProcedure(conn, args)
+    suspend fun sleepOneSecond(args: SleepOneSecondArgs): ProcedureResult = sleepOneSecondProcedure(conn, args)
+    suspend fun withTx(args: WithTxArgs): ProcedureResult = withTxProcedure(conn, args)
 }
 
 class From {
@@ -94,9 +94,9 @@ import spacetimedb.tables.*
 
 data object GetMySchemaViaHttpArgs
 
-internal fun getMySchemaViaHttpProcedure(conn: DbConnection, args: GetMySchemaViaHttpArgs, callback: ((ProcedureResult) -> Unit)? = null) {
+internal suspend fun getMySchemaViaHttpProcedure(conn: DbConnection, args: GetMySchemaViaHttpArgs): ProcedureResult {
     val writer = BsatnWriter()
-    conn.callProcedure("get_my_schema_via_http", writer.toByteArray(), callback)
+    return conn.callProcedure("get_my_schema_via_http", writer.toByteArray())
 }
 '''
 "spacetimedb/procedures/ReturnValue.kt" = '''
@@ -119,10 +119,10 @@ data class ReturnValueArgs(
     val foo: ULong,
 )
 
-internal fun returnValueProcedure(conn: DbConnection, args: ReturnValueArgs, callback: ((ProcedureResult) -> Unit)? = null) {
+internal suspend fun returnValueProcedure(conn: DbConnection, args: ReturnValueArgs): ProcedureResult {
     val writer = BsatnWriter()
     writer.writeU64(args.foo)
-    conn.callProcedure("return_value", writer.toByteArray(), callback)
+    return conn.callProcedure("return_value", writer.toByteArray())
 }
 '''
 "spacetimedb/procedures/SleepOneSecond.kt" = '''
@@ -143,9 +143,9 @@ import spacetimedb.tables.*
 
 data object SleepOneSecondArgs
 
-internal fun sleepOneSecondProcedure(conn: DbConnection, args: SleepOneSecondArgs, callback: ((ProcedureResult) -> Unit)? = null) {
+internal suspend fun sleepOneSecondProcedure(conn: DbConnection, args: SleepOneSecondArgs): ProcedureResult {
     val writer = BsatnWriter()
-    conn.callProcedure("sleep_one_second", writer.toByteArray(), callback)
+    return conn.callProcedure("sleep_one_second", writer.toByteArray())
 }
 '''
 "spacetimedb/procedures/WithTx.kt" = '''
@@ -166,9 +166,9 @@ import spacetimedb.tables.*
 
 data object WithTxArgs
 
-internal fun withTxProcedure(conn: DbConnection, args: WithTxArgs, callback: ((ProcedureResult) -> Unit)? = null) {
+internal suspend fun withTxProcedure(conn: DbConnection, args: WithTxArgs): ProcedureResult {
     val writer = BsatnWriter()
-    conn.callProcedure("with_tx", writer.toByteArray(), callback)
+    return conn.callProcedure("with_tx", writer.toByteArray())
 }
 '''
 "spacetimedb/reducers/Add.kt" = '''
@@ -192,12 +192,12 @@ data class AddArgs(
     val age: UByte,
 )
 
-internal fun addReducer(conn: DbConnection, args: AddArgs, callback: ((ReducerResult) -> Unit)? = null) {
+internal suspend fun addReducer(conn: DbConnection, args: AddArgs): ReducerResult {
     val writer = BsatnWriter()
     writer.writeString(args.name)
     writer.writeU8(args.age)
     val bytes = writer.toByteArray()
-    conn.callReducer("add", bytes, callback)
+    return conn.callReducer("add", bytes)
 }
 '''
 "spacetimedb/reducers/AddPlayer.kt" = '''
@@ -220,11 +220,11 @@ data class AddPlayerArgs(
     val name: String,
 )
 
-internal fun addPlayerReducer(conn: DbConnection, args: AddPlayerArgs, callback: ((ReducerResult) -> Unit)? = null) {
+internal suspend fun addPlayerReducer(conn: DbConnection, args: AddPlayerArgs): ReducerResult {
     val writer = BsatnWriter()
     writer.writeString(args.name)
     val bytes = writer.toByteArray()
-    conn.callReducer("add_player", bytes, callback)
+    return conn.callReducer("add_player", bytes)
 }
 '''
 "spacetimedb/reducers/AddPrivate.kt" = '''
@@ -247,11 +247,11 @@ data class AddPrivateArgs(
     val name: String,
 )
 
-internal fun addPrivateReducer(conn: DbConnection, args: AddPrivateArgs, callback: ((ReducerResult) -> Unit)? = null) {
+internal suspend fun addPrivateReducer(conn: DbConnection, args: AddPrivateArgs): ReducerResult {
     val writer = BsatnWriter()
     writer.writeString(args.name)
     val bytes = writer.toByteArray()
-    conn.callReducer("add_private", bytes, callback)
+    return conn.callReducer("add_private", bytes)
 }
 '''
 "spacetimedb/reducers/AssertCallerIdentityIsModuleIdentity.kt" = '''
@@ -272,9 +272,9 @@ import spacetimedb.tables.*
 
 data object AssertCallerIdentityIsModuleIdentityArgs
 
-internal fun assertCallerIdentityIsModuleIdentityReducer(conn: DbConnection, args: AssertCallerIdentityIsModuleIdentityArgs, callback: ((ReducerResult) -> Unit)? = null) {
+internal suspend fun assertCallerIdentityIsModuleIdentityReducer(conn: DbConnection, args: AssertCallerIdentityIsModuleIdentityArgs): ReducerResult {
     val bytes = ByteArray(0)
-    conn.callReducer("assert_caller_identity_is_module_identity", bytes, callback)
+    return conn.callReducer("assert_caller_identity_is_module_identity", bytes)
 }
 '''
 "spacetimedb/reducers/DeletePlayer.kt" = '''
@@ -297,11 +297,11 @@ data class DeletePlayerArgs(
     val id: ULong,
 )
 
-internal fun deletePlayerReducer(conn: DbConnection, args: DeletePlayerArgs, callback: ((ReducerResult) -> Unit)? = null) {
+internal suspend fun deletePlayerReducer(conn: DbConnection, args: DeletePlayerArgs): ReducerResult {
     val writer = BsatnWriter()
     writer.writeU64(args.id)
     val bytes = writer.toByteArray()
-    conn.callReducer("delete_player", bytes, callback)
+    return conn.callReducer("delete_player", bytes)
 }
 '''
 "spacetimedb/reducers/DeletePlayersByName.kt" = '''
@@ -324,11 +324,11 @@ data class DeletePlayersByNameArgs(
     val name: String,
 )
 
-internal fun deletePlayersByNameReducer(conn: DbConnection, args: DeletePlayersByNameArgs, callback: ((ReducerResult) -> Unit)? = null) {
+internal suspend fun deletePlayersByNameReducer(conn: DbConnection, args: DeletePlayersByNameArgs): ReducerResult {
     val writer = BsatnWriter()
     writer.writeString(args.name)
     val bytes = writer.toByteArray()
-    conn.callReducer("delete_players_by_name", bytes, callback)
+    return conn.callReducer("delete_players_by_name", bytes)
 }
 '''
 "spacetimedb/reducers/ListOverAge.kt" = '''
@@ -351,11 +351,11 @@ data class ListOverAgeArgs(
     val age: UByte,
 )
 
-internal fun listOverAgeReducer(conn: DbConnection, args: ListOverAgeArgs, callback: ((ReducerResult) -> Unit)? = null) {
+internal suspend fun listOverAgeReducer(conn: DbConnection, args: ListOverAgeArgs): ReducerResult {
     val writer = BsatnWriter()
     writer.writeU8(args.age)
     val bytes = writer.toByteArray()
-    conn.callReducer("list_over_age", bytes, callback)
+    return conn.callReducer("list_over_age", bytes)
 }
 '''
 "spacetimedb/reducers/LogModuleIdentity.kt" = '''
@@ -376,9 +376,9 @@ import spacetimedb.tables.*
 
 data object LogModuleIdentityArgs
 
-internal fun logModuleIdentityReducer(conn: DbConnection, args: LogModuleIdentityArgs, callback: ((ReducerResult) -> Unit)? = null) {
+internal suspend fun logModuleIdentityReducer(conn: DbConnection, args: LogModuleIdentityArgs): ReducerResult {
     val bytes = ByteArray(0)
-    conn.callReducer("log_module_identity", bytes, callback)
+    return conn.callReducer("log_module_identity", bytes)
 }
 '''
 "spacetimedb/reducers/QueryPrivate.kt" = '''
@@ -399,9 +399,9 @@ import spacetimedb.tables.*
 
 data object QueryPrivateArgs
 
-internal fun queryPrivateReducer(conn: DbConnection, args: QueryPrivateArgs, callback: ((ReducerResult) -> Unit)? = null) {
+internal suspend fun queryPrivateReducer(conn: DbConnection, args: QueryPrivateArgs): ReducerResult {
     val bytes = ByteArray(0)
-    conn.callReducer("query_private", bytes, callback)
+    return conn.callReducer("query_private", bytes)
 }
 '''
 "spacetimedb/reducers/SayHello.kt" = '''
@@ -422,9 +422,9 @@ import spacetimedb.tables.*
 
 data object SayHelloArgs
 
-internal fun sayHelloReducer(conn: DbConnection, args: SayHelloArgs, callback: ((ReducerResult) -> Unit)? = null) {
+internal suspend fun sayHelloReducer(conn: DbConnection, args: SayHelloArgs): ReducerResult {
     val bytes = ByteArray(0)
-    conn.callReducer("say_hello", bytes, callback)
+    return conn.callReducer("say_hello", bytes)
 }
 '''
 "spacetimedb/reducers/Test.kt" = '''
@@ -450,14 +450,14 @@ data class TestArgs(
     val arg4: NamespaceTestF,
 )
 
-internal fun testReducer(conn: DbConnection, args: TestArgs, callback: ((ReducerResult) -> Unit)? = null) {
+internal suspend fun testReducer(conn: DbConnection, args: TestArgs): ReducerResult {
     val writer = BsatnWriter()
     TestA.write(writer, args.arg)
     TestB.write(writer, args.arg2)
     NamespaceTestC.write(writer, args.arg3)
     NamespaceTestF.write(writer, args.arg4)
     val bytes = writer.toByteArray()
-    conn.callReducer("test", bytes, callback)
+    return conn.callReducer("test", bytes)
 }
 '''
 "spacetimedb/reducers/TestBtreeIndexArgs.kt" = '''
@@ -478,9 +478,9 @@ import spacetimedb.tables.*
 
 data object TestBtreeIndexArgsArgs
 
-internal fun testBtreeIndexArgsReducer(conn: DbConnection, args: TestBtreeIndexArgsArgs, callback: ((ReducerResult) -> Unit)? = null) {
+internal suspend fun testBtreeIndexArgsReducer(conn: DbConnection, args: TestBtreeIndexArgsArgs): ReducerResult {
     val bytes = ByteArray(0)
-    conn.callReducer("test_btree_index_args", bytes, callback)
+    return conn.callReducer("test_btree_index_args", bytes)
 }
 '''
 "spacetimedb/tables/LoggedOutPlayer.kt" = '''

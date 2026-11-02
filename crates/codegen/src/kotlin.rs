@@ -516,7 +516,7 @@ impl Lang for Kotlin<'_> {
             writeln!(out, "data object {pascal_name}Args");
         }
         writeln!(out);
-        writeln!(out, "internal fun {camel_name}Reducer(conn: DbConnection, args: {pascal_name}Args, callback: ((ReducerResult) -> Unit)? = null) {{");
+        writeln!(out, "internal suspend fun {camel_name}Reducer(conn: DbConnection, args: {pascal_name}Args): ReducerResult {{");
         out.indent(1);
         if reducer.params_for_generate.elements.is_empty() {
             writeln!(out, "val bytes = ByteArray(0)");
@@ -527,7 +527,7 @@ impl Lang for Kotlin<'_> {
             }
             writeln!(out, "val bytes = writer.toByteArray()");
         }
-        writeln!(out, "conn.callReducer(\"{name}\", bytes, callback)", name = reducer.name);
+        writeln!(out, "return conn.callReducer(\"{name}\", bytes)", name = reducer.name);
         out.dedent(1);
         writeln!(out, "}}");
 
@@ -564,13 +564,13 @@ impl Lang for Kotlin<'_> {
             writeln!(out, "data object {pascal_name}Args");
         }
         writeln!(out);
-        writeln!(out, "internal fun {camel_name}Procedure(conn: DbConnection, args: {pascal_name}Args, callback: ((ProcedureResult) -> Unit)? = null) {{");
+        writeln!(out, "internal suspend fun {camel_name}Procedure(conn: DbConnection, args: {pascal_name}Args): ProcedureResult {{");
         out.indent(1);
         writeln!(out, "val writer = BsatnWriter()");
         for (param_name, param_type) in &procedure.params_for_generate {
             write_bsatn_serialize_field(module, out, "args", param_name, param_type);
         }
-        writeln!(out, "conn.callProcedure(\"{name}\", writer.toByteArray(), callback)", name = procedure.name);
+        writeln!(out, "return conn.callProcedure(\"{name}\", writer.toByteArray())", name = procedure.name);
         out.dedent(1);
         writeln!(out, "}}");
 
@@ -615,7 +615,7 @@ impl Lang for Kotlin<'_> {
         for reducer in iter_reducers(module, options.visibility) {
             let camel = reducer.accessor_name.deref().to_case(Case::Camel);
             let pascal = reducer.accessor_name.deref().to_case(Case::Pascal);
-            writeln!(out, "    fun {camel}(args: {pascal}Args, callback: ((ReducerResult) -> Unit)? = null) = {camel}Reducer(conn, args, callback)");
+            writeln!(out, "    suspend fun {camel}(args: {pascal}Args): ReducerResult = {camel}Reducer(conn, args)");
         }
         writeln!(out, "}}");
         writeln!(out);
@@ -624,7 +624,7 @@ impl Lang for Kotlin<'_> {
         for procedure in iter_procedures(module, options.visibility) {
             let camel = procedure.accessor_name.deref().to_case(Case::Camel);
             let pascal = procedure.accessor_name.deref().to_case(Case::Pascal);
-            writeln!(out, "    fun {camel}(args: {pascal}Args, callback: ((ProcedureResult) -> Unit)? = null) = {camel}Procedure(conn, args, callback)");
+            writeln!(out, "    suspend fun {camel}(args: {pascal}Args): ProcedureResult = {camel}Procedure(conn, args)");
         }
         writeln!(out, "}}");
         writeln!(out);

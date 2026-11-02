@@ -198,7 +198,6 @@ class LiveEdgeCaseTest {
 
         runBlocking {
             val connected = CompletableDeferred<Unit>()
-            val result = CompletableDeferred<ReducerResult>()
 
             val conn = DbConnection.builder()
                 .withUri(serverUri)
@@ -209,11 +208,9 @@ class LiveEdgeCaseTest {
 
             withTimeout(5000.milliseconds) { connected.await() }
 
-            conn.callReducer("nonexistent_reducer_xyz", byteArrayOf()) { r ->
-                result.complete(r)
+            val res = withTimeout(5000.milliseconds) {
+                conn.callReducer("nonexistent_reducer_xyz", byteArrayOf())
             }
-
-            val res = withTimeout(5000.milliseconds) { result.await() }
             // Should get an error outcome, not a crash
             assertNotNull(res)
             println("PASS: Non-existent reducer returned: ${res.outcome::class.simpleName}")
@@ -228,7 +225,6 @@ class LiveEdgeCaseTest {
         runBlocking {
             val connected = CompletableDeferred<Unit>()
             val subApplied = CompletableDeferred<Unit>()
-            val result = CompletableDeferred<ReducerResult>()
 
             val conn = DbConnection.builder()
                 .withUri(serverUri)
@@ -246,11 +242,9 @@ class LiveEdgeCaseTest {
             withTimeout(5000.milliseconds) { subApplied.await() }
 
             // add_player expects a String arg — empty args should cause an error
-            conn.callReducer("add_player", byteArrayOf()) { r ->
-                result.complete(r)
+            val res = withTimeout(5000.milliseconds) {
+                conn.callReducer("add_player", byteArrayOf())
             }
-
-            val res = withTimeout(5000.milliseconds) { result.await() }
             assertNotNull(res)
             // Should be an error since args don't match expected schema
             println("PASS: Empty args to add_player returned: ${res.outcome::class.simpleName}")
@@ -356,8 +350,6 @@ class LiveEdgeCaseTest {
             val connected = CompletableDeferred<Unit>()
             val subApplied = CompletableDeferred<Unit>()
             val targetCount = 20
-            val results = java.util.concurrent.ConcurrentHashMap<UInt, ReducerResult>()
-            val allDone = CompletableDeferred<Unit>()
 
             val conn = DbConnection.builder()
                 .withUri(serverUri)
@@ -374,24 +366,25 @@ class LiveEdgeCaseTest {
             withTimeout(5000.milliseconds) { connected.await() }
             withTimeout(5000.milliseconds) { subApplied.await() }
 
+            val results = java.util.concurrent.ConcurrentHashMap<UInt, ReducerResult>()
+
             val elapsed = measureTime {
-                repeat(targetCount) { i ->
-                    val w = BsatnWriter(64)
-                    w.writeString("Rapid_${System.currentTimeMillis()}_$i")
-                    conn.callReducer("add_player", w.toByteArray()) { result ->
-                        results[result.requestId] = result
-                        if (results.size >= targetCount && !allDone.isCompleted) {
-                            allDone.complete(Unit)
+                coroutineScope {
+                    repeat(targetCount) { i ->
+                        launch {
+                            val w = BsatnWriter(64)
+                            w.writeString("Rapid_${System.currentTimeMillis()}_$i")
+                            val result = conn.callReducer("add_player", w.toByteArray())
+                            results[result.requestId] = result
                         }
                     }
                 }
-                withTimeout(15000.milliseconds) { allDone.await() }
             }
 
-            assertEquals(targetCount, results.size, "All $targetCount callbacks should fire")
+            assertEquals(targetCount, results.size, "All $targetCount reducers should return")
             // Verify all got unique requestIds
             assertEquals(targetCount, results.keys.size)
-            println("PASS: $targetCount rapid reducer calls all received callbacks in ${elapsed.inWholeMilliseconds}ms")
+            println("PASS: $targetCount rapid reducer calls all completed in ${elapsed.inWholeMilliseconds}ms")
             conn.disconnect()
         }
     }

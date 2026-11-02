@@ -141,23 +141,16 @@ class Keynote2BenchmarkTest {
                 launch(Dispatchers.Default) {
                     var tIdx = workerIdx * transfersPerWorker
 
-                    // Pipeline batch: fire MAX_INFLIGHT calls, suspend until all respond
+                    // Pipeline batch: fire MAX_INFLIGHT calls concurrently, wait for all to complete
                     suspend fun runBatch(): Long {
-                        val batchDone = CompletableDeferred<Unit>()
-                        val remaining = AtomicInteger(MAX_INFLIGHT)
-
-                        repeat(MAX_INFLIGHT) {
-                            val idx = tIdx % TOTAL_PAIRS
-                            tIdx++
-                            val args = encodeTransfer(fromArr[idx], toArr[idx], AMOUNT)
-                            conn.callReducer("transfer", args) {
-                                if (remaining.decrementAndGet() == 0) {
-                                    batchDone.complete(Unit)
-                                }
+                        coroutineScope {
+                            repeat(MAX_INFLIGHT) {
+                                val idx = tIdx % TOTAL_PAIRS
+                                tIdx++
+                                val args = encodeTransfer(fromArr[idx], toArr[idx], AMOUNT)
+                                launch { conn.callReducer("transfer", args) }
                             }
                         }
-
-                        batchDone.await()
                         return MAX_INFLIGHT.toLong()
                     }
 

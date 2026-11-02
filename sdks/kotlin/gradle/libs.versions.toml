@@ -12,4 +12,5 @@ brotli-dec = { module = "org.brotli:dec", version = "0.1.2" }
 
 [plugins]
 kotlinMultiplatform = { id = "org.jetbrains.kotlin.multiplatform", version.ref = "kotlin" }
+kotlinJvm = { id = "org.jetbrains.kotlin.jvm" , version.ref = "kotlin"}
 kotlinAtomicfu = { id = "org.jetbrains.kotlin.plugin.atomicfu", version.ref = "kotlin" }
