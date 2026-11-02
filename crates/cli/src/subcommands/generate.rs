@@ -7,7 +7,7 @@ use clap::ArgAction::{Set, SetTrue};
 use fs_err as fs;
 use spacetimedb_codegen::{
     generate, generate_receiver_bindings, private_table_names, CodegenOptions, CodegenVisibility, Csharp,
-    ImportExtension, Kotlin, Lang, OutputFile, ReceiverLanguage, Rust, TypeScript, UnrealCpp, AUTO_GENERATED_PREFIX,
+    ImportExtension, Lang, OutputFile, ReceiverLanguage, Rust, TypeScript, UnrealCpp, AUTO_GENERATED_PREFIX,
 };
 use spacetimedb_lib::de::serde::DeserializeWrapper;
 use spacetimedb_lib::RawModuleDef;
@@ -436,7 +436,7 @@ pub struct GenerateRunConfig {
     pub wasm_file: Option<PathBuf>,
     pub js_file: Option<PathBuf>,
     pub lang: Language,
-    pub namespace: Option<String>,
+    pub namespace: String,
     pub module_name: Option<String>,
     pub module_prefix: Option<String>,
     pub build_options: String,
@@ -473,7 +473,9 @@ fn prepare_generate_run_configs<'a>(
             validate_dependency_name(name)?;
         }
         let requested_lang = command_config.get_one::<Language>("language")?;
-        let namespace = command_config.get_one::<String>("namespace")?;
+        let namespace = command_config
+            .get_one::<String>("namespace")?
+            .unwrap_or_else(|| "SpacetimeDB.Types".to_string());
         let module_name = command_config.get_one::<String>("unreal_module_name")?;
         let module_prefix = command_config.get_one::<String>("module_prefix")?;
         let build_options = command_config
@@ -542,6 +544,7 @@ fn prepare_generate_run_configs<'a>(
             let default_dir = match lang {
                 Language::Rust | Language::TypeScript => "src/remote_bindings",
                 Language::Csharp | Language::Cpp => "remote_bindings",
+                Language::Kotlin => "module_bindings",
                 Language::UnrealCpp => unreachable!("Unreal module bindings rejected above"),
             };
             command_config
@@ -790,7 +793,7 @@ pub async fn run_prepared_generate_configs(
                 Language::Cpp => ReceiverLanguage::Cpp,
                 Language::Kotlin => ReceiverLanguage::Kotlin {
                     package_name: if namespace_from_cli {
-                        run.namespace.as_deref().unwrap()
+                        &run.namespace
                     } else {
                         "spacetimedb"
                     },
@@ -837,6 +840,9 @@ pub async fn run_prepared_generate_configs(
                 }
                 Language::Cpp => {
                     anyhow::bail!("C++ client bindings are not supported; use --lang unrealcpp for Unreal")
+                }
+                Language::Kotlin => {
+                    anyhow::bail!("Kotlin is a module binding target; use the default --bindings module")
                 }
             };
             generate(&module, gen_lang, &options)
