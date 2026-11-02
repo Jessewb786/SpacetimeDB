@@ -1,6 +1,7 @@
+import { getByAccessorPath } from '../lib/accessor_path';
 import { onDestroy } from 'svelte';
 import { get } from 'svelte/store';
-import type { InferTypeOfRow } from '../lib/type_builders';
+import type { InferTypeOfParams } from '../lib/type_builders';
 import type { UntypedReducerDef } from '../sdk/reducers';
 import { useSpacetimeDB } from './useSpacetimeDB';
 import type { Prettify } from '../lib/type_util';
@@ -9,7 +10,7 @@ type IsEmptyObject<T> = [keyof T] extends [never] ? true : false;
 type MaybeParams<T> = IsEmptyObject<T> extends true ? [] : [params: T];
 
 type ParamsType<R extends UntypedReducerDef> = MaybeParams<
-  Prettify<InferTypeOfRow<R['params']>>
+  Prettify<InferTypeOfParams<R['params']>>
 >;
 
 export function useReducer<ReducerDef extends UntypedReducerDef>(
@@ -30,7 +31,7 @@ export function useReducer<ReducerDef extends UntypedReducerDef>(
     const conn = state.getConnection();
     if (!conn) return;
 
-    const fn = (conn.reducers as any)[reducerName] as (
+    const fn = getByAccessorPath(conn.reducers, reducerName) as (
       ...p: ParamsType<ReducerDef>
     ) => Promise<void>;
     if (queueRef.length) {
@@ -53,7 +54,7 @@ export function useReducer<ReducerDef extends UntypedReducerDef>(
         queueRef.push({ params, resolve, reject });
       });
     }
-    const fn = (conn.reducers as any)[reducerName] as (
+    const fn = getByAccessorPath(conn.reducers, reducerName) as (
       ...p: ParamsType<ReducerDef>
     ) => Promise<void>;
     return fn(...params);

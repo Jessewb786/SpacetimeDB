@@ -1,22 +1,43 @@
-#[cfg(feature = "browser")]
 use std::path::Path;
+#[cfg(feature = "browser")]
+use std::process::{Command, Stdio};
+#[cfg(feature = "browser")]
+use std::sync::OnceLock;
 
 use spacetimedb_testing::sdk::{Test, TestBuilder};
 
+#[cfg(feature = "browser")]
+fn node_websocket_flag() -> &'static str {
+    static FLAG: OnceLock<&'static str> = OnceLock::new();
+    FLAG.get_or_init(|| {
+        let supports_experimental_flag = Command::new("node")
+            .args(["--experimental-websocket", "-e", ""])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+
+        if supports_experimental_flag {
+            "--experimental-websocket "
+        } else {
+            ""
+        }
+    })
+}
+
 fn platform_test_builder(client_project: &str, run_selector: Option<&str>) -> TestBuilder {
-    let builder = Test::builder();
-    let builder = builder.with_client(client_project);
+    let package_name = Path::new(client_project)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("client project path should end in a UTF-8 directory name")
+        .to_owned();
+    let builder = Test::builder().with_client(client_project);
 
     // Note: `run_selector` is intentionally interpreted differently by mode:
     // - Native mode uses it as a CLI subcommand (`cargo run -- <selector>`), with `None` => `cargo run`.
     // - Web mode assembles the Node/wasm-bindgen commands directly in this test harness.
     #[cfg(feature = "browser")]
     {
-        let package_name = Path::new(client_project)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .expect("client project path should end in a UTF-8 directory name")
-            .to_owned();
         let artifact_name = package_name.replace('-', "_");
         let target_dir = std::env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| {
             // Cargo workspace members emit into the workspace target directory, not each crate's
@@ -62,7 +83,9 @@ fn platform_test_builder(client_project: &str, run_selector: Option<&str>) -> Te
               if (!run) throw new Error(\"No exported run/main/start function from wasm module\"); \
               const dbName = process.env.SPACETIME_SDK_TEST_DB_NAME; \
               if (!dbName) throw new Error(\"Missing SPACETIME_SDK_TEST_DB_NAME\"); \
-              await run({run_selector:?}, dbName); \
+              const serverUrl = process.env.SPACETIME_SDK_TEST_SERVER_URL; \
+              if (!serverUrl) throw new Error(\"Missing SPACETIME_SDK_TEST_SERVER_URL\"); \
+              await run({run_selector:?}, dbName, serverUrl); \
               // These wasm clients run under Node rather than a browser. Some tests intentionally leave
               // websocket/event-loop work alive once their assertions are complete, so exit here to keep
               // non-lifecycle tests from hanging on leftover handles after `run()` has finished.
@@ -70,11 +93,12 @@ fn platform_test_builder(client_project: &str, run_selector: Option<&str>) -> Te
             }})().catch((e) => {{ console.error(e); process.exit(1); }});"
         );
         let node_script = shlex::try_quote(&node_script).expect("inline Node script should be shell-quotable");
-        let run_command = format!("node --experimental-websocket -e {node_script}");
+        let run_command = format!("node {}-e {node_script}", node_websocket_flag());
 
         builder
             .with_compile_command(compile_command)
             .with_run_command(run_command)
+            .with_prepared_browser_client(artifact_name, run_selector)
     }
 
     #[cfg(not(feature = "browser"))]
@@ -87,6 +111,7 @@ fn platform_test_builder(client_project: &str, run_selector: Option<&str>) -> Te
         builder
             .with_compile_command("cargo build")
             .with_run_command(run_command)
+            .with_prepared_native_client(package_name, run_selector)
     }
 }
 
@@ -98,7 +123,7 @@ macro_rules! declare_tests_with_suffix {
             const MODULE: &str = concat!("sdk-test", $suffix);
             const CLIENT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/test-client");
 
-            fn make_test(subcommand: &str) -> Test {
+            pub(super) fn make_test(subcommand: &str) -> Test {
                 super::platform_test_builder(CLIENT, Some(subcommand))
                     .with_name(subcommand)
                     .with_module(MODULE)
@@ -275,8 +300,7 @@ macro_rules! declare_tests_with_suffix {
 
             #[test]
             fn reauth() {
-                make_test("reauth-part-1").run();
-                make_test("reauth-part-2").run();
+                make_test("reauth").run();
             }
 
             #[test]
@@ -284,8 +308,7 @@ macro_rules! declare_tests_with_suffix {
                 make_test("reconnect-different-connection-id").run();
             }
 
-            #[test]
-            fn connect_disconnect_callbacks() {
+            pub(super) fn make_connect_disconnect_test() -> Test {
                 const CONNECT_DISCONNECT_CLIENT: &str =
                     concat!(env!("CARGO_MANIFEST_DIR"), "/tests/connect_disconnect_client");
 
@@ -301,7 +324,11 @@ macro_rules! declare_tests_with_suffix {
                     .with_generate_private_items(true)
                     .with_bindings_dir("src/module_bindings")
                     .build()
-                    .run();
+            }
+
+            #[test]
+            fn connect_disconnect_callbacks() {
+                make_connect_disconnect_test().run();
             }
 
             #[test]
@@ -417,7 +444,7 @@ mod event_table_tests {
     const MODULE: &str = "sdk-test-event-table";
     const CLIENT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/event-table-client");
 
-    fn make_test(subcommand: &str) -> Test {
+    pub(super) fn make_test(subcommand: &str) -> Test {
         super::platform_test_builder(CLIENT, Some(subcommand))
             .with_name(subcommand)
             .with_module(MODULE)
@@ -455,7 +482,7 @@ macro_rules! procedure_tests {
             const MODULE: &str = concat!("sdk-test-procedure", $suffix);
             const CLIENT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/procedure-client");
 
-            fn make_test(subcommand: &str) -> Test {
+            pub(super) fn make_test(subcommand: &str) -> Test {
                 super::platform_test_builder(CLIENT, Some(subcommand))
                     .with_name(subcommand)
                     .with_module(MODULE)
@@ -513,6 +540,52 @@ procedure_tests!(typescript_procedures, "-ts");
 procedure_tests!(cpp_procedures, "-cpp");
 procedure_tests!(csharp_procedures, "-cs");
 
+mod rust_procedure_concurrency {
+    use spacetimedb_testing::sdk::Test;
+
+    const MODULE: &str = "sdk-test-procedure-concurrency";
+    const CLIENT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/procedure-concurrency-client");
+
+    pub(super) fn make_test(subcommand: &str) -> Test {
+        super::platform_test_builder(CLIENT, Some(subcommand))
+            .with_name(subcommand)
+            .with_module(MODULE)
+            .with_language("rust")
+            .with_generate_private_items(true)
+            .with_bindings_dir("src/module_bindings")
+            .build()
+    }
+
+    #[test]
+    fn procedure_reducer_interleaving() {
+        make_test("procedure-reducer-interleaving").run()
+    }
+
+    #[test]
+    fn procedure_reducer_same_client_not_interleaved() {
+        make_test("procedure-reducer-same-client-interleaved").run()
+    }
+
+    #[test]
+    fn procedure_concurrent_with_scheduled_reducer() {
+        make_test("procedure-concurrent-with-scheduled-reducer").run()
+    }
+
+    /// Test that the scheduler can dispatch a scheduled reducer while a previous
+    /// scheduled procedure is still running.
+    #[test]
+    fn scheduled_procedure_scheduled_reducer_interleaved() {
+        make_test("scheduled-procedure-scheduled-reducer-interleaved").run()
+    }
+
+    /// Test that an update made while its procedure is running fires at its
+    /// scheduled time and is not replaced by the original invocation.
+    #[test]
+    fn scheduled_procedure_update_while_inflight() {
+        make_test("scheduled-procedure-update-while-inflight").run()
+    }
+}
+
 macro_rules! view_tests {
     ($mod_name:ident, $suffix:literal) => {
         mod $mod_name {
@@ -521,7 +594,7 @@ macro_rules! view_tests {
             const MODULE: &str = concat!("sdk-test-view", $suffix);
             const CLIENT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/view-client");
 
-            fn make_test(subcommand: &str) -> Test {
+            pub(super) fn make_test(subcommand: &str) -> Test {
                 super::platform_test_builder(CLIENT, Some(subcommand))
                     .with_name(subcommand)
                     .with_module(MODULE)
@@ -583,7 +656,7 @@ mod case_conversion_ts {
     const MODULE: &str = "sdk-test-case-conversion-ts";
     const CLIENT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/case-conversion-client");
 
-    fn make_test(subcommand: &str) -> Test {
+    pub(super) fn make_test(subcommand: &str) -> Test {
         Test::builder()
             .with_name(subcommand)
             .with_module(MODULE)
@@ -592,6 +665,8 @@ mod case_conversion_ts {
             .with_bindings_dir("src/module_bindings")
             .with_compile_command("cargo build")
             .with_run_command(format!("cargo run -- {}", subcommand))
+            .with_prepared_native_client("case-conversion-client", [subcommand])
+            .with_prepared_client_key("case-conversion-client-ts-module")
             .build()
     }
 
@@ -632,7 +707,7 @@ mod case_conversion_rust {
     const MODULE: &str = "sdk-test-case-conversion";
     const CLIENT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/case-conversion-client");
 
-    fn make_test(subcommand: &str) -> Test {
+    pub(super) fn make_test(subcommand: &str) -> Test {
         Test::builder()
             .with_name(subcommand)
             .with_module(MODULE)
@@ -641,6 +716,7 @@ mod case_conversion_rust {
             .with_bindings_dir("src/module_bindings")
             .with_compile_command("cargo build")
             .with_run_command(format!("cargo run -- {}", subcommand))
+            .with_prepared_native_client("case-conversion-client", [subcommand])
             .build()
     }
 
@@ -689,7 +765,7 @@ mod case_conversion_rust_ts_client {
         "/../../crates/bindings-typescript/case-conversion-test-client"
     );
 
-    fn make_test(subcommand: &str) -> Test {
+    pub(super) fn make_test(subcommand: &str) -> Test {
         Test::builder()
             .with_name(subcommand)
             .with_module(MODULE)
@@ -700,6 +776,7 @@ mod case_conversion_rust_ts_client {
                 "sh -c 'pnpm install && pnpm --dir .. run build && pnpm exec prettier --write src/module_bindings && pnpm run build'",
             )
             .with_run_command(format!("node dist/index.js {}", subcommand))
+            .with_prepared_node_client("dist/index.js", [subcommand])
             .build()
     }
 
@@ -739,7 +816,7 @@ macro_rules! view_pk_tests {
             const MODULE: &str = concat!("sdk-test-view-pk", $suffix);
             const CLIENT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/view-pk-client");
 
-            fn make_test(subcommand: &str) -> Test {
+            pub(super) fn make_test(subcommand: &str) -> Test {
                 super::platform_test_builder(CLIENT, Some(subcommand))
                     .with_name(subcommand)
                     .with_module(MODULE)
@@ -768,3 +845,70 @@ macro_rules! view_pk_tests {
 
 view_pk_tests!(rust_view_pk, "");
 view_pk_tests!(csharp_view_pk, "-cs");
+view_pk_tests!(typescript_view_pk, "-ts");
+view_pk_tests!(cpp_view_pk, "-cpp");
+
+macro_rules! procedural_view_pk_tests {
+    ($mod_name:ident, $module:literal) => {
+        mod $mod_name {
+            use spacetimedb_testing::sdk::Test;
+
+            const MODULE: &str = $module;
+            const CLIENT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/procedural-view-pk-client");
+
+            pub(super) fn make_test(subcommand: &str) -> Test {
+                super::platform_test_builder(CLIENT, Some(subcommand))
+                    .with_name(subcommand)
+                    .with_module(MODULE)
+                    .with_language("rust")
+                    .with_bindings_dir("src/module_bindings")
+                    .build()
+            }
+
+            #[test]
+            fn sender_scoped_procedural_pk_view() {
+                make_test("sender-scoped-pk-view").run()
+            }
+
+            #[test]
+            fn procedural_view_pk_left_semijoin() {
+                make_test("view-pk-left-semijoin").run()
+            }
+
+            #[test]
+            fn procedural_view_pk_right_semijoin() {
+                make_test("view-pk-right-semijoin").run()
+            }
+        }
+    };
+}
+
+procedural_view_pk_tests!(rust_procedural_view_pk, "sdk-test-procedural-view-pk");
+procedural_view_pk_tests!(csharp_procedural_view_pk, "sdk-test-procedural-view-pk-cs");
+procedural_view_pk_tests!(typescript_procedural_view_pk, "sdk-test-procedural-view-pk-ts");
+procedural_view_pk_tests!(cpp_procedural_view_pk, "sdk-test-procedural-view-pk-cpp");
+
+#[test]
+#[ignore = "CI prepares shared SDK client artifacts before partitioning"]
+fn prepare_clients() {
+    let prepared_clients = [
+        // The Rust module exposes additional private reducers when generating with
+        // `--include-private`; use the C++ module whose schema matches the committed
+        // bindings shared by these otherwise equivalent module variants.
+        cpp::make_test("insert-primitive"),
+        rust::make_connect_disconnect_test(),
+        event_table_tests::make_test("event-table"),
+        rust_procedures::make_test("procedure-return-values"),
+        rust_procedure_concurrency::make_test("procedure-reducer-interleaving"),
+        rust_view::make_test("view-anonymous-subscribe"),
+        case_conversion_ts::make_test("insert-player"),
+        case_conversion_rust::make_test("insert-player"),
+        case_conversion_rust_ts_client::make_test("insert-player"),
+        rust_view_pk::make_test("view-pk-on-update"),
+        rust_procedural_view_pk::make_test("sender-scoped-pk-view"),
+    ];
+
+    for client in prepared_clients {
+        client.prepare();
+    }
+}

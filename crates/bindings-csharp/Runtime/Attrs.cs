@@ -1,5 +1,16 @@
 namespace SpacetimeDB
 {
+    /// <summary>Declares the complete environment schema for this module.</summary>
+    [AttributeUsage(AttributeTargets.Struct)]
+    public sealed class EnvAttribute : Attribute { }
+
+    /// <summary>Restricts one declared string to these exact permitted values.</summary>
+    [AttributeUsage(AttributeTargets.Field)]
+    public sealed class EnvValuesAttribute(params string[] values) : Attribute
+    {
+        public string[] Values { get; } = values;
+    }
+
     namespace Internal
     {
         [Flags]
@@ -33,7 +44,7 @@ namespace SpacetimeDB
     /// so that any row permitted by at least one filter is visible.
     ///
     /// The query follows the same syntax as a subscription query.
-    /// See the <see href="https://spacetimedb.com/docs/sql">SQL reference</see> for more information.
+    /// See the <see href="https://spacetimedb.com/docs/reference/sql">SQL reference</see> for more information.
     ///
     /// This is an experimental feature and subject to change in the future.
     /// </summary>
@@ -102,6 +113,11 @@ namespace SpacetimeDB
         public string? Name { get; init; }
 
         /// <summary>
+        /// The source/accessor name of the view return column that identifies rows.
+        /// </summary>
+        public string? PrimaryKey { get; init; }
+
+        /// <summary>
         /// Marks the view as callable by any client. Leave false to restrict to the module owner.
         /// </summary>
         public bool Public { get; init; } = false;
@@ -167,6 +183,10 @@ namespace SpacetimeDB
                 {
                     return value.ToString()?.ToLower()!;
                 }
+                if (value is float f)
+                {
+                    return $"{f.ToString("R", System.Globalization.CultureInfo.InvariantCulture)}F";
+                }
                 var str = value.ToString();
                 if (value is string)
                 {
@@ -203,4 +223,43 @@ namespace SpacetimeDB
     {
         public string? Name { get; init; }
     }
+
+    [AttributeUsage(AttributeTargets.Method, Inherited = false)]
+    public sealed class HttpHandlerAttribute() : Attribute { }
+
+    [AttributeUsage(AttributeTargets.Method, Inherited = false)]
+    public sealed class HttpRouterAttribute() : Attribute { }
+
+#if NET10_0_OR_GREATER
+    [AttributeUsage(AttributeTargets.Assembly, AllowMultiple = false)]
+    public sealed class ModuleDescriptorAttribute(Type descriptorType) : Attribute
+    {
+        public Type DescriptorType { get; } = descriptorType;
+    }
+
+    /// <summary>
+    /// Places the module contributions of the marker type's assembly in a namespace.
+    /// The consuming module chooses the placement; the marker may be any accessible type.
+    /// Requires .NET 10 and C# 14.
+    /// </summary>
+    /// <remarks>
+    /// An assembly may be mounted only once. Dependencies cannot declare mounts.
+    /// Named namespaces cannot contain lifecycle reducers, RLS filters, or nonempty
+    /// environment declarations. Dependencies without a mount register automatically in public.
+    /// </remarks>
+    [AttributeUsage(AttributeTargets.Assembly, AllowMultiple = true)]
+    public sealed class NamespaceAttribute(System.Type marker) : Attribute
+    {
+        public System.Type Marker { get; } = marker;
+
+        /// <summary>The C# member name used for the mounted module.</summary>
+        public string Accessor { get; set; } = "";
+
+        /// <summary>
+        /// The database namespace. When omitted, the host applies the parent module's
+        /// case conversion policy to Accessor.
+        /// </summary>
+        public string? Name { get; set; }
+    }
+#endif
 }

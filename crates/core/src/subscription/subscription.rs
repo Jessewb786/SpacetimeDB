@@ -1,8 +1,8 @@
 use super::execution_unit::QueryHash;
-use super::module_subscription_manager::Plan;
+use super::query::CompiledQuery;
 use crate::db::relational_db::RelationalDB;
+use crate::db::sql::ast::SchemaViewer;
 use crate::error::DBError;
-use crate::sql::ast::SchemaViewer;
 use spacetimedb_datastore::locking_tx_datastore::state_view::StateView;
 use spacetimedb_lib::db::auth::StTableType;
 use spacetimedb_lib::identity::AuthCtx;
@@ -16,7 +16,7 @@ pub(crate) fn get_all<T, F, I>(
     relational_db: &RelationalDB,
     tx: &T,
     auth: &AuthCtx,
-) -> Result<Vec<Plan>, DBError>
+) -> Result<Vec<CompiledQuery>, DBError>
 where
     T: StateView,
     F: Fn(&RelationalDB, &T) -> Result<I, DBError>,
@@ -24,15 +24,18 @@ where
 {
     Ok(get_all_tables(relational_db, tx)?
         .filter(|t| t.table_type == StTableType::User && auth.has_read_access(t.table_access) && !t.is_event)
+        // A view with args can't be queried without them.
+        .filter(|t| t.view_info.as_ref().is_none_or(|view| view.params.elements.is_empty()))
         .map(|schema| {
             let sql = format!("SELECT * FROM {}", schema.table_name);
             let tx = SchemaViewer::new(tx, auth);
-            SubscriptionPlan::compile(&sql, &tx, auth).map(|(plans, has_param)| {
-                Plan::new(
+            SubscriptionPlan::compile_plans(&sql, &tx, auth).map(|(plans, has_param, physical_plans)| CompiledQuery {
+                plan: super::module_subscription_manager::Plan::new(
                     plans,
                     QueryHash::from_string(&sql, auth.caller(), auth.bypass_rls() || has_param),
                     sql,
-                )
+                ),
+                physical_plans,
             })
         })
         .collect::<Result<_, _>>()?)

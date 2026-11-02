@@ -62,6 +62,9 @@ export const ExplicitNameEntry = __t.enum('ExplicitNameEntry', {
   get Index() {
     return NameMapping;
   },
+  get Namespace() {
+    return NameMapping;
+  },
 });
 export type ExplicitNameEntry = __Infer<typeof ExplicitNameEntry>;
 
@@ -158,6 +161,15 @@ export const Lifecycle = __t.enum('Lifecycle', {
 });
 export type Lifecycle = __Infer<typeof Lifecycle>;
 
+// The tagged union or sum type for the algebraic type `MethodOrAny`.
+export const MethodOrAny = __t.enum('MethodOrAny', {
+  Any: __t.unit(),
+  get Method() {
+    return HttpMethod;
+  },
+});
+export type MethodOrAny = __Infer<typeof MethodOrAny>;
+
 // The tagged union or sum type for the algebraic type `MiscModuleExport`.
 export const MiscModuleExport = __t.enum('MiscModuleExport', {
   get TypeAlias() {
@@ -238,6 +250,42 @@ export const RawConstraintDefV9 = __t.object('RawConstraintDefV9', {
   },
 });
 export type RawConstraintDefV9 = __Infer<typeof RawConstraintDefV9>;
+
+// The tagged union or sum type for the algebraic type `RawEnvVarTypeV10`.
+export const RawEnvVarTypeV10 = __t.enum('RawEnvVarTypeV10', {
+  String: __t.unit(),
+  StringLiteral: __t.string(),
+  Union: __t.array(__t.string()),
+});
+export type RawEnvVarTypeV10 = __Infer<typeof RawEnvVarTypeV10>;
+
+export const RawEnvironmentDeclarationV10 = __t.object(
+  'RawEnvironmentDeclarationV10',
+  {
+    name: __t.string(),
+    get ty() {
+      return RawEnvVarTypeV10;
+    },
+    optional: __t.bool(),
+  }
+);
+export type RawEnvironmentDeclarationV10 = __Infer<
+  typeof RawEnvironmentDeclarationV10
+>;
+
+export const RawHttpHandlerDefV10 = __t.object('RawHttpHandlerDefV10', {
+  sourceName: __t.string(),
+});
+export type RawHttpHandlerDefV10 = __Infer<typeof RawHttpHandlerDefV10>;
+
+export const RawHttpRouteDefV10 = __t.object('RawHttpRouteDefV10', {
+  handlerFunction: __t.string(),
+  get method() {
+    return MethodOrAny;
+  },
+  path: __t.string(),
+});
+export type RawHttpRouteDefV10 = __Infer<typeof RawHttpRouteDefV10>;
 
 // The tagged union or sum type for the algebraic type `RawIndexAlgorithm`.
 export const RawIndexAlgorithm = __t.enum('RawIndexAlgorithm', {
@@ -358,6 +406,24 @@ export const RawModuleDefV10Section = __t.enum('RawModuleDefV10Section', {
   get ExplicitNames() {
     return ExplicitNames;
   },
+  get HttpHandlers() {
+    return __t.array(RawHttpHandlerDefV10);
+  },
+  get HttpRoutes() {
+    return __t.array(RawHttpRouteDefV10);
+  },
+  get ViewPrimaryKeys() {
+    return __t.array(RawViewPrimaryKeyDefV10);
+  },
+  get Submodules() {
+    return __t.array(RawSubmoduleV10);
+  },
+  get Environment() {
+    return __t.array(RawEnvironmentDeclarationV10);
+  },
+  get Outboxes() {
+    return __t.array(RawOutboxDefV10);
+  },
 });
 export type RawModuleDefV10Section = __Infer<typeof RawModuleDefV10Section>;
 
@@ -398,6 +464,16 @@ export const RawModuleDefV9 = __t.object('RawModuleDefV9', {
   },
 });
 export type RawModuleDefV9 = __Infer<typeof RawModuleDefV9>;
+
+export const RawOutboxDefV10 = __t.object('RawOutboxDefV10', {
+  tableName: __t.string(),
+  remoteReducer: __t.string(),
+  targetColumn: __t.u16(),
+  argColumns: __t.array(__t.u16()),
+  onResultReducer: __t.option(__t.string()),
+  signatureHash: __t.u256(),
+});
+export type RawOutboxDefV10 = __Infer<typeof RawOutboxDefV10>;
 
 export const RawProcedureDefV10 = __t.object('RawProcedureDefV10', {
   sourceName: __t.string(),
@@ -514,6 +590,14 @@ export const RawSequenceDefV9 = __t.object('RawSequenceDefV9', {
   increment: __t.i128(),
 });
 export type RawSequenceDefV9 = __Infer<typeof RawSequenceDefV9>;
+
+export const RawSubmoduleV10 = __t.object('RawSubmoduleV10', {
+  namespace: __t.string(),
+  get module(): any {
+    return RawModuleDefV10;
+  },
+});
+export type RawSubmoduleV10 = __Infer<typeof RawSubmoduleV10>;
 
 export const RawTableDefV10 = __t.object('RawTableDefV10', {
   sourceName: __t.string(),
@@ -641,6 +725,12 @@ export const RawViewDefV9 = __t.object('RawViewDefV9', {
   },
 });
 export type RawViewDefV9 = __Infer<typeof RawViewDefV9>;
+
+export const RawViewPrimaryKeyDefV10 = __t.object('RawViewPrimaryKeyDefV10', {
+  viewSourceName: __t.string(),
+  columns: __t.array(__t.string()),
+});
+export type RawViewPrimaryKeyDefV10 = __Infer<typeof RawViewPrimaryKeyDefV10>;
 
 export const ReducerDef = __t.object('ReducerDef', {
   name: __t.string(),

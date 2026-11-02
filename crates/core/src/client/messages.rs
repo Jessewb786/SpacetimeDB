@@ -7,6 +7,7 @@ use crate::subscription::websocket_building::{brotli_compress, decide_compressio
 use bytes::{BufMut, Bytes, BytesMut};
 use bytestring::ByteString;
 use derive_more::From;
+use spacetimedb_client_api_messages::energy::EnergyQuanta;
 use spacetimedb_client_api_messages::websocket::common::{self as ws_common, RowListLen as _};
 use spacetimedb_client_api_messages::websocket::v1::{self as ws_v1};
 use spacetimedb_client_api_messages::websocket::v2 as ws_v2;
@@ -16,6 +17,7 @@ use spacetimedb_lib::ser::serde::SerializeWrapper;
 use spacetimedb_lib::{AlgebraicValue, ConnectionId, TimeDuration, Timestamp};
 use spacetimedb_primitives::TableId;
 use spacetimedb_sats::bsatn;
+use spacetimedb_sats::raw_identifier::RawIdentifier;
 use spacetimedb_schema::table_name::TableName;
 use std::sync::Arc;
 use std::time::Instant;
@@ -314,6 +316,7 @@ impl OutboundMessage {
             Self::V2(message) => match message {
                 ws_v2::ServerMessage::InitialConnection(_) => None,
                 ws_v2::ServerMessage::SubscribeApplied(_) => Some(WorkloadType::Subscribe),
+                ws_v2::ServerMessage::SubscribeBatchApplied(_) => Some(WorkloadType::Subscribe),
                 ws_v2::ServerMessage::UnsubscribeApplied(_) => Some(WorkloadType::Unsubscribe),
                 ws_v2::ServerMessage::SubscriptionError(_) => None,
                 ws_v2::ServerMessage::TransactionUpdate(_) => Some(WorkloadType::Update),
@@ -329,6 +332,16 @@ fn v2_message_num_rows(message: &ws_v2::ServerMessage) -> Option<usize> {
     match message {
         ws_v2::ServerMessage::InitialConnection(_) => None,
         ws_v2::ServerMessage::SubscribeApplied(message) => Some(count_query_rows(&message.rows)),
+        ws_v2::ServerMessage::SubscribeBatchApplied(message) => Some(
+            message
+                .results
+                .iter()
+                .map(|result| match &result.outcome {
+                    ws_v2::SubscribeSetOutcome::Applied(rows) => count_query_rows(rows),
+                    ws_v2::SubscribeSetOutcome::Error(_) => 0,
+                })
+                .sum(),
+        ),
         ws_v2::ServerMessage::UnsubscribeApplied(message) => {
             Some(message.rows.as_ref().map(count_query_rows).unwrap_or_default())
         }
@@ -434,7 +447,12 @@ impl ToProtocol for TransactionUpdateMessage {
                     args,
                     request_id,
                 },
-                energy_quanta_used: event.energy_quanta_used,
+                // This conversion is lying. We used to tell the client how much eV a transaction
+                // used, but now the database just tracks cpu usage, and it's converted to energy
+                // elsewhere. So, we just pretend that this is `EnergyQuanta` when it's actually
+                // a different unit, and it doesn't really matter to the client anyway.
+                // TODO(noa): maybe we could just have this be zero, unconditionally?
+                energy_quanta_used: EnergyQuanta::new(event.execution_budget_used.get().into()),
                 total_host_execution_duration: event.host_execution_duration.into(),
                 caller_connection_id: event.caller_connection_id.unwrap_or(ConnectionId::ZERO),
             };
@@ -602,7 +620,7 @@ impl ToProtocol for SubscriptionMessage {
                             query_id,
                             rows: ws_v1::SubscribeRows {
                                 table_id: result.table_id,
-                                table_name: result.table_name.into(),
+                                table_name: RawIdentifier::new(&*result.table_name),
                                 table_rows,
                             },
                         }
@@ -615,7 +633,7 @@ impl ToProtocol for SubscriptionMessage {
                             query_id,
                             rows: ws_v1::SubscribeRows {
                                 table_id: result.table_id,
-                                table_name: result.table_name.into(),
+                                table_name: RawIdentifier::new(&*result.table_name),
                                 table_rows,
                             },
                         }
@@ -633,7 +651,7 @@ impl ToProtocol for SubscriptionMessage {
                             query_id,
                             rows: ws_v1::SubscribeRows {
                                 table_id: result.table_id,
-                                table_name: result.table_name.into(),
+                                table_name: RawIdentifier::new(&*result.table_name),
                                 table_rows,
                             },
                         }
@@ -646,7 +664,7 @@ impl ToProtocol for SubscriptionMessage {
                             query_id,
                             rows: ws_v1::SubscribeRows {
                                 table_id: result.table_id,
-                                table_name: result.table_name.into(),
+                                table_name: RawIdentifier::new(&*result.table_name),
                                 table_rows,
                             },
                         }

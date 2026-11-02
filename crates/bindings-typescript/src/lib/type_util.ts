@@ -3,20 +3,31 @@ import type { Identity } from './identity';
 import type { ScheduleAt } from './schedule_at';
 import type { TimeDuration } from './time_duration';
 import type { Timestamp } from './timestamp';
+import type { Uuid } from './uuid';
 
 type DoNotPrettify =
   | Identity
   | ConnectionId
   | Timestamp
   | TimeDuration
-  | ScheduleAt;
+  | ScheduleAt
+  | Uuid;
+
+type Primitive = string | number | boolean | bigint | symbol | null | undefined;
 
 /**
  * Utility to make TS show cleaner types by flattening intersections.
+ *
+ * Primitives pass through unchanged. A branded primitive (`string & Brand`)
+ * is an object type, but mapping it yields a structural record of `String`'s
+ * members that no longer satisfies `string`. The outer `object` check keeps a
+ * generic `Prettify<T>` spreadable.
  */
-export type Prettify<T> = T extends DoNotPrettify
-  ? T
-  : { [K in keyof T]: T[K] } & {};
+export type Prettify<T> = T extends object
+  ? T extends DoNotPrettify | Primitive
+    ? T
+    : { [K in keyof T]: T[K] } & {}
+  : T;
 
 /**
  * Helper function to sets a field in an object
@@ -48,6 +59,31 @@ export type Values<T> = T[keyof T];
  */
 export type CollapseTuple<A extends any[]> = A extends [infer T] ? T : A;
 
+/**
+ * Conditional-type helper for distinguishing a single type from a union.
+ */
+export type IsUnion<T, U = T> = [T] extends [never]
+  ? false
+  : T extends any
+    ? [U] extends [T]
+      ? false
+      : true
+    : false;
+
+/**
+ * True when an object type has exactly one known key.
+ *
+ * If keys widen to plain `string`, the exact count is no longer knowable, so
+ * treat it as valid and let narrower call sites or runtime checks handle it.
+ */
+export type HasExactlyOneKnownKey<T> = [keyof T] extends [never]
+  ? false
+  : string extends keyof T
+    ? true
+    : IsUnion<keyof T> extends true
+      ? false
+      : true;
+
 type CamelCaseImpl<S extends string> = S extends `${infer Head}_${infer Tail}`
   ? `${Head}${Capitalize<CamelCaseImpl<Tail>>}`
   : S extends `${infer Head}-${infer Tail}`
@@ -60,6 +96,19 @@ type CamelCaseImpl<S extends string> = S extends `${infer Head}_${infer Tail}`
  * - Normalizes the *first* character to lowercase (e.g. "User_Name" -> "userName")
  */
 export type CamelCase<S extends string> = Uncapitalize<CamelCaseImpl<S>>;
+
+type AccessorHead<K extends string> = K extends `${infer H}.${string}` ? H : K;
+type AccessorTail<
+  K extends string,
+  H extends string,
+> = K extends `${H}.${infer R}` ? R : never;
+
+/** Splits dotted keys into nested objects: `{ 'a.b': X, c: Y }` becomes `{ a: { b: X }, c: Y }`. */
+export type NestAccessors<T extends Record<string, unknown>> = {
+  readonly [H in AccessorHead<keyof T & string>]: H extends keyof T
+    ? T[H]
+    : NestAccessors<{ [K in keyof T & string as AccessorTail<K, H>]: T[K] }>;
+};
 
 /** Type safe conversion from "some_identifier-name" to "some_identifier_name"
  * - No spaces; allowed separators: "_" and "-"

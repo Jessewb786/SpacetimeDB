@@ -231,15 +231,7 @@ internal static class ErrorDescriptor
             method => method
         );
 
-    // TODO: Remove once Views support arguments: Views must have no arguments beyond the context.
-    public static readonly ErrorDescriptor<MethodDeclarationSyntax> ViewArgsUnsupported =
-        new(
-            group,
-            "Views must have no arguments beyond the context.",
-            method =>
-                $"View '{method.Identifier}' must have no arguments beyond the context. This is a temporary limitation.",
-            method => method
-        );
+    public static readonly UnusedErrorDescriptor ViewArgsUnsupported = new(group);
 
     public static readonly ErrorDescriptor<IFieldSymbol> SettingsMustBeConstCaseConversionPolicy =
         new(
@@ -266,5 +258,170 @@ internal static class ErrorDescriptor
             _ =>
                 $"Index attribute on a table declaration must specify Accessor. Field-level index attributes may omit Accessor and default to the field name.",
             attr => attr
+        );
+
+    public static readonly ErrorDescriptor<MethodDeclarationSyntax> HttpHandlerContextParam =
+        new(
+            group,
+            "HTTP handlers must have a first argument of type HandlerContext",
+            method =>
+                $"HTTP handler method {method.Identifier} does not have a HandlerContext parameter.",
+            method => method.ParameterList
+        );
+
+    public static readonly ErrorDescriptor<MethodDeclarationSyntax> HttpHandlerRequestParam =
+        new(
+            group,
+            "HTTP handlers must have a second argument of type HttpRequest",
+            method =>
+                $"HTTP handler method {method.Identifier} does not have an HttpRequest parameter.",
+            method => method.ParameterList
+        );
+
+    public static readonly ErrorDescriptor<MethodDeclarationSyntax> HttpHandlerReturnType =
+        new(
+            group,
+            "HTTP handlers must return HttpResponse",
+            method =>
+                $"HTTP handler method {method.Identifier} returns {method.ReturnType} instead of HttpResponse.",
+            method => method.ReturnType
+        );
+
+    public static readonly ErrorDescriptor<MethodDeclarationSyntax> HttpRouterSignature =
+        new(
+            group,
+            "HTTP routers must be static parameterless methods returning Router",
+            method =>
+                $"HTTP router method {method.Identifier} must be static, parameterless, and return Router.",
+            method => method
+        );
+
+    public static readonly ErrorDescriptor<(
+        MethodDeclarationSyntax method,
+        string prefix
+    )> HttpHandlerReservedPrefix =
+        new(
+            group,
+            "HTTP handler method has a reserved name prefix",
+            ctx =>
+                $"HTTP handler method {ctx.method.Identifier} starts with '{ctx.prefix}', which is a reserved prefix.",
+            ctx => ctx.method.Identifier
+        );
+
+    public static readonly ErrorDescriptor<IEnumerable<string>> DuplicateHttpRouters =
+        new(
+            group,
+            "Multiple [SpacetimeDB.HttpRouter] declarations",
+            fullNames =>
+                $"[SpacetimeDB.HttpRouter] is declared multiple times: {string.Join(", ", fullNames)}",
+            _ => Location.None
+        );
+
+    public static readonly ErrorDescriptor<MethodDeclarationSyntax> HttpHandlerSignature =
+        new(
+            group,
+            "HTTP handlers must be non-generic methods with exactly two parameters",
+            method =>
+                $"HTTP handler method {method.Identifier} must be non-generic and take exactly two parameters.",
+            method => method.ParameterList
+        );
+
+    public static readonly ErrorDescriptor<(
+        MethodDeclarationSyntax method,
+        SyntaxNode primaryKeySyntax,
+        string primaryKey,
+        string rowType
+    )> ViewPrimaryKeyColumnNotFound =
+        new(
+            group,
+            "View primary key column not found",
+            ctx =>
+                $"View '{ctx.method.Identifier}' declares primary key '{ctx.primaryKey}', but row type '{ctx.rowType}' does not have a field with that source name.",
+            ctx => ctx.primaryKeySyntax
+        );
+
+    public static readonly ErrorDescriptor<(
+        MethodDeclarationSyntax method,
+        SyntaxNode primaryKeySyntax,
+        string primaryKey,
+        string type
+    )> ViewPrimaryKeyNotFilterable =
+        new(
+            group,
+            "View primary key column type is not supported",
+            ctx =>
+                $"View '{ctx.method.Identifier}' declares primary key '{ctx.primaryKey}', but its type '{ctx.type}' is not supported for view primary keys.",
+            ctx => ctx.primaryKeySyntax
+        );
+
+    public static readonly ErrorDescriptor<(
+        ISymbol symbol,
+        string message
+    )> InvalidEnvironmentDeclaration =
+        new(group, "Invalid environment declaration", ctx => $"{ctx.message}", ctx => ctx.symbol);
+
+    public static readonly ErrorDescriptor<(
+        AttributeData attribute,
+        string message
+    )> InvalidNamespace =
+        new(group, "Invalid namespace mount", ctx => $"{ctx.message}", ctx => ctx.attribute);
+
+    public static readonly ErrorDescriptor<(
+        string accessor,
+        string first,
+        string second
+    )> NamespaceAccessorCollision =
+        new(
+            group,
+            "Conflicting module accessors",
+            ctx =>
+                $"Accessor '{ctx.accessor}' is contributed by both '{ctx.first}' and '{ctx.second}'. Mount the conflicting dependency with a distinct accessor.",
+            _ => Location.None
+        );
+
+    public static readonly ErrorDescriptor<string> InvalidNamespaceComposition =
+        new(group, "Invalid namespace composition", message => $"{message}", _ => Location.None);
+
+    public static readonly ErrorDescriptor<(
+        string assembly,
+        string name,
+        string declarations
+    )> MountedRootOnlyDeclarations =
+        new(
+            group,
+            "Root-only declarations in mounted dependency",
+            ctx =>
+                $"Dependency '{ctx.assembly}' mounted in namespace '{ctx.name}' declares {ctx.declarations}. These declarations are only supported in the root scope. Move them to the root or register the dependency in the root's public scope. A public contribution inside a named submodule remains in that submodule's scope. Root-defined RLS may target namespace-qualified tables.",
+            _ => Location.None
+        );
+
+    public static readonly ErrorDescriptor<(
+        Location location,
+        string scope,
+        string name,
+        string first,
+        string second
+    )> GeneratedNameCollision =
+        new(
+            group,
+            "Conflicting generated C# names",
+            ctx =>
+                $"Generated C# name '{ctx.scope}.{ctx.name}' is used by both {ctx.first} and {ctx.second}. Choose distinct accessors or member names.",
+            ctx => ctx.location
+        );
+
+    public static readonly ErrorDescriptor<(
+        string scope,
+        string owner,
+        string policy,
+        string dependency,
+        string dependencyPolicy
+    )> ConflictingCaseConversionPolicies =
+        new(
+            group,
+            "Conflicting case conversion policies",
+            ctx =>
+                $"Assembly '{ctx.owner}' uses case conversion policy '{ctx.policy}' in scope '{ctx.scope}', but dependency '{ctx.dependency}' declares '{ctx.dependencyPolicy}' in the same scope. Use the same policy, remove the dependency's setting to inherit the containing scope's policy, or mount the dependency in a distinct namespace.",
+            _ => Location.None
         );
 }

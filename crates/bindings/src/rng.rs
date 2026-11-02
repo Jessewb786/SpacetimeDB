@@ -1,4 +1,5 @@
 #[cfg(feature = "unstable")]
+use crate::http::HandlerContext;
 use crate::ProcedureContext;
 use crate::{rand, ReducerContext};
 use core::cell::UnsafeCell;
@@ -30,8 +31,7 @@ impl ReducerContext {
     ///
     /// ```no_run
     /// # #[cfg(target_arch = "wasm32")] mod demo {
-    /// use spacetimedb::{reducer, ReducerContext};
-    /// use rand::Rng;
+    /// use spacetimedb::{rand::Rng, reducer, ReducerContext};
     ///
     /// #[spacetimedb::reducer]
     /// fn rng_demo(ctx: &spacetimedb::ReducerContext) {
@@ -40,7 +40,7 @@ impl ReducerContext {
     ///
     ///     // Or, cache locally for reuse:
     ///     let mut rng = ctx.rng();
-    ///     let floats: Vec<f32> = rng.sample_iter(rand::distributions::Standard).collect();
+    ///     let floats: Vec<f32> = rng.sample_iter(spacetimedb::rand::distributions::Standard).collect();
     /// }
     /// # }
     /// ```
@@ -51,14 +51,12 @@ impl ReducerContext {
     }
 }
 
-#[cfg(feature = "unstable")]
 impl ProcedureContext {
     /// Generates a random value.
     ///
     /// Similar to [`rand::random()`], but using [`StdbRng`] instead.
     ///
     /// See also [`ProcedureContext::rng()`].
-    #[cfg(feature = "unstable")]
     pub fn random<T>(&self) -> T
     where
         Standard: Distribution<T>,
@@ -74,22 +72,45 @@ impl ProcedureContext {
     /// # Examples
     /// ```no_run
     /// # #[cfg(target_arch = "wasm32")] mod demo {
-    /// use spacetimedb::{procedure, ProcedureContext};
-    /// use rand::Rng;
+    /// use spacetimedb::{rand::Rng, procedure, ProcedureContext};
     ///
     /// #[spacetimedb::procedure]
-    /// fn rng_demo(ctx: &spacetimedb::ProcedureContext) {
+    /// fn rng_demo(ctx: &mut spacetimedb::ProcedureContext) {
     ///     // Can be used in method chaining style:
     ///     let digit = ctx.rng().gen_range(0..=9);
     ///
     ///     // Or, cache locally for reuse:
     ///     let mut rng = ctx.rng();
-    ///    let floats: Vec<f32> = rng.sample_iter(rand::distributions::Standard).collect();
+    ///     let floats: Vec<f32> = rng.sample_iter(spacetimedb::rand::distributions::Standard).collect();
     /// }
     /// # }
     /// ```
     ///
     /// For more information, see [`StdbRng`] and [`rand::Rng`].
+    pub fn rng(&self) -> &StdbRng {
+        self.rng.get_or_init(|| StdbRng::seed_from_ts(self.timestamp))
+    }
+}
+
+#[cfg(feature = "unstable")]
+impl HandlerContext {
+    /// Generates a random value.
+    ///
+    /// Similar to [`rand::random()`], but using [`StdbRng`] instead.
+    ///
+    /// See also [`HandlerContext::rng()`].
+    #[cfg(feature = "unstable")]
+    pub fn random<T>(&self) -> T
+    where
+        Standard: Distribution<T>,
+    {
+        Standard.sample(&mut self.rng())
+    }
+
+    /// Retrieve the random number generator for this handler invocation,
+    /// seeded by the handler timestamp.
+    ///
+    /// If you only need a single random value, you can use [`HandlerContext::random()`].
     #[cfg(feature = "unstable")]
     pub fn rng(&self) -> &StdbRng {
         self.rng.get_or_init(|| StdbRng::seed_from_ts(self.timestamp))
@@ -124,6 +145,25 @@ pub struct StdbRng {
 }
 
 impl StdbRng {
+    #[cfg(all(feature = "test-utils", not(target_arch = "wasm32")))]
+    pub(crate) fn seeded_cell(seed: Option<u64>) -> std::cell::OnceCell<Self> {
+        let cell = std::cell::OnceCell::new();
+        if let Some(seed) = seed {
+            cell.set(Self::seed_from_u64(seed))
+                .ok()
+                .expect("new OnceCell should accept seeded test rng");
+        }
+        cell
+    }
+
+    #[cfg(all(feature = "test-utils", not(target_arch = "wasm32")))]
+    fn seed_from_u64(seed: u64) -> Self {
+        Self {
+            rng: StdRng::seed_from_u64(seed).into(),
+            _marker: PhantomData,
+        }
+    }
+
     /// Seeds a [`StdbRng`] from a timestamp.
     fn seed_from_ts(timestamp: Timestamp) -> Self {
         Self {

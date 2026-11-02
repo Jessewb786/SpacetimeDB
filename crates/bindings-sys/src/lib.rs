@@ -644,7 +644,6 @@ pub mod raw {
         pub fn get_jwt(connection_id_ptr: *const u8, bytes_source_id: *mut BytesSource) -> u16;
     }
 
-    #[cfg(feature = "unstable")]
     #[link(wasm_import_module = "spacetime_10.3")]
     unsafe extern "C" {
         /// Suspends execution of this WASM instance until approximately `wake_at_micros_since_unix_epoch`.
@@ -775,7 +774,6 @@ pub mod raw {
         /// - `body_ptr` is NULL or `body_ptr[..body_len]` is not in bounds of WASM memory.
         /// - `out` is NULL or `out[..size_of::<RowIter>()]` is not in bounds of WASM memory.
         /// - `request_ptr[..request_len]` does not contain a valid BSATN-serialized `spacetimedb_lib::http::Request` object.
-        #[cfg(feature = "unstable")]
         pub fn procedure_http_request(
             request_ptr: *const u8,
             request_len: u32,
@@ -885,6 +883,17 @@ pub mod raw {
         pub fn datastore_clear(table_id: TableId, out: *mut u64) -> u16;
     }
 
+    #[link(wasm_import_module = "spacetime_10.6")]
+    unsafe extern "C" {
+        /// Read a UTF-8 environment value. Writes INVALID for a missing key;
+        /// present empty strings have a valid BytesSource. Returns ordinary errno.
+        /// Invalid keys return HOST_CALL_FAILURE. NO_SPACE means 256 byte
+        /// sources remain unconsumed; consume a source before retrying.
+        /// Calls outside a reducer/view
+        /// transaction or procedure return NOT_IN_TRANSACTION.
+        pub fn env_get(key: *const u8, key_len: usize, out: *mut BytesSource) -> u16;
+    }
+
     /// What strategy does the database index use?
     ///
     /// See also: <https://www.postgresql.org/docs/current/sql-createindex.html>
@@ -975,6 +984,293 @@ pub mod raw {
             /// Currently unused?
             fn __migrate_database__XXXX(sender: Identity, timestamp: Timestamp, something: Buffer) -> Result;
         }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+mod native_link_stubs {
+    use super::raw::{BytesSink, BytesSource, RowIter};
+    use super::{ColId, IndexId, TableId};
+
+    const NOT_IN_TRANSACTION: u16 = super::Errno::NOT_IN_TRANSACTION.code();
+    const NO_SUCH_BYTES: u16 = super::Errno::NO_SUCH_BYTES.code();
+    const NO_SUCH_ITER: u16 = super::Errno::NO_SUCH_ITER.code();
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn table_id_from_name(_name: *const u8, _name_len: usize, _out: *mut TableId) -> u16 {
+        NOT_IN_TRANSACTION
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn index_id_from_name(_name: *const u8, _name_len: usize, _out: *mut IndexId) -> u16 {
+        NOT_IN_TRANSACTION
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn datastore_table_row_count(_table_id: TableId, _out: *mut u64) -> u16 {
+        NOT_IN_TRANSACTION
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn datastore_table_scan_bsatn(_table_id: TableId, _out: *mut RowIter) -> u16 {
+        NOT_IN_TRANSACTION
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn datastore_index_scan_range_bsatn(
+        _index_id: IndexId,
+        _prefix_ptr: *const u8,
+        _prefix_len: usize,
+        _prefix_elems: ColId,
+        _rstart_ptr: *const u8,
+        _rstart_len: usize,
+        _rend_ptr: *const u8,
+        _rend_len: usize,
+        _out: *mut RowIter,
+    ) -> u16 {
+        NOT_IN_TRANSACTION
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn datastore_btree_scan_bsatn(
+        index_id: IndexId,
+        prefix_ptr: *const u8,
+        prefix_len: usize,
+        prefix_elems: ColId,
+        rstart_ptr: *const u8,
+        rstart_len: usize,
+        rend_ptr: *const u8,
+        rend_len: usize,
+        out: *mut RowIter,
+    ) -> u16 {
+        datastore_index_scan_range_bsatn(
+            index_id,
+            prefix_ptr,
+            prefix_len,
+            prefix_elems,
+            rstart_ptr,
+            rstart_len,
+            rend_ptr,
+            rend_len,
+            out,
+        )
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn datastore_delete_by_index_scan_range_bsatn(
+        _index_id: IndexId,
+        _prefix_ptr: *const u8,
+        _prefix_len: usize,
+        _prefix_elems: ColId,
+        _rstart_ptr: *const u8,
+        _rstart_len: usize,
+        _rend_ptr: *const u8,
+        _rend_len: usize,
+        _out: *mut u32,
+    ) -> u16 {
+        NOT_IN_TRANSACTION
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn datastore_delete_by_btree_scan_bsatn(
+        index_id: IndexId,
+        prefix_ptr: *const u8,
+        prefix_len: usize,
+        prefix_elems: ColId,
+        rstart_ptr: *const u8,
+        rstart_len: usize,
+        rend_ptr: *const u8,
+        rend_len: usize,
+        out: *mut u32,
+    ) -> u16 {
+        datastore_delete_by_index_scan_range_bsatn(
+            index_id,
+            prefix_ptr,
+            prefix_len,
+            prefix_elems,
+            rstart_ptr,
+            rstart_len,
+            rend_ptr,
+            rend_len,
+            out,
+        )
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn datastore_delete_all_by_eq_bsatn(
+        _table_id: TableId,
+        _rel_ptr: *const u8,
+        _rel_len: usize,
+        _out: *mut u32,
+    ) -> u16 {
+        NOT_IN_TRANSACTION
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn row_iter_bsatn_advance(_iter: RowIter, _buffer_ptr: *mut u8, _buffer_len_ptr: *mut usize) -> i16 {
+        NO_SUCH_ITER as i16
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn row_iter_bsatn_close(_iter: RowIter) -> u16 {
+        NO_SUCH_ITER
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn datastore_insert_bsatn(_table_id: TableId, _row_ptr: *mut u8, _row_len_ptr: *mut usize) -> u16 {
+        NOT_IN_TRANSACTION
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn datastore_update_bsatn(
+        _table_id: TableId,
+        _index_id: IndexId,
+        _row_ptr: *mut u8,
+        _row_len_ptr: *mut usize,
+    ) -> u16 {
+        NOT_IN_TRANSACTION
+    }
+
+    #[cfg(feature = "unstable")]
+    #[unsafe(no_mangle)]
+    pub extern "C" fn volatile_nonatomic_schedule_immediate(
+        _name: *const u8,
+        _name_len: usize,
+        _args: *const u8,
+        _args_len: usize,
+    ) {
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn bytes_sink_write(_sink: BytesSink, _buffer_ptr: *const u8, _buffer_len_ptr: *mut usize) -> u16 {
+        NO_SUCH_BYTES
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn bytes_source_read(
+        _source: BytesSource,
+        _buffer_ptr: *mut u8,
+        _buffer_len_ptr: *mut usize,
+    ) -> i16 {
+        NO_SUCH_BYTES as i16
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn console_log(
+        _level: u8,
+        _target_ptr: *const u8,
+        _target_len: usize,
+        _filename_ptr: *const u8,
+        _filename_len: usize,
+        _line_number: u32,
+        _message_ptr: *const u8,
+        _message_len: usize,
+    ) {
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn console_timer_start(_name_ptr: *const u8, _name_len: usize) -> u32 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn console_timer_end(_timer_id: u32) -> u16 {
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn identity(out_ptr: *mut u8) {
+        if !out_ptr.is_null() {
+            // SAFETY: This is a native link stub used only outside the host ABI. Writing
+            // Identity::ZERO keeps callers that accidentally reach it deterministic.
+            unsafe { core::ptr::write_bytes(out_ptr, 0, 32) };
+        }
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn bytes_source_remaining_length(_source: BytesSource, _out: *mut u32) -> i16 {
+        NO_SUCH_BYTES as i16
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn get_jwt(_connection_id_ptr: *const u8, bytes_source_id: *mut BytesSource) -> u16 {
+        if !bytes_source_id.is_null() {
+            // SAFETY: The pointer is provided by the safe wrapper and points to a
+            // BytesSource output slot when non-null.
+            unsafe { bytes_source_id.write(BytesSource::INVALID) };
+        }
+        NOT_IN_TRANSACTION
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn env_get(_key: *const u8, _key_len: usize, bytes_source_id: *mut BytesSource) -> u16 {
+        if !bytes_source_id.is_null() {
+            // SAFETY: The pointer is provided by the safe wrapper and points to a
+            // BytesSource output slot when non-null.
+            unsafe { bytes_source_id.write(BytesSource::INVALID) };
+        }
+        NOT_IN_TRANSACTION
+    }
+
+    #[cfg(feature = "unstable")]
+    #[unsafe(no_mangle)]
+    pub extern "C" fn procedure_sleep_until(wake_at_micros_since_unix_epoch: i64) -> i64 {
+        wake_at_micros_since_unix_epoch
+    }
+
+    #[cfg(feature = "unstable")]
+    #[unsafe(no_mangle)]
+    pub extern "C" fn procedure_start_mut_tx(_out: *mut i64) -> u16 {
+        NOT_IN_TRANSACTION
+    }
+
+    #[cfg(feature = "unstable")]
+    #[unsafe(no_mangle)]
+    pub extern "C" fn procedure_commit_mut_tx() -> u16 {
+        NOT_IN_TRANSACTION
+    }
+
+    #[cfg(feature = "unstable")]
+    #[unsafe(no_mangle)]
+    pub extern "C" fn procedure_abort_mut_tx() -> u16 {
+        NOT_IN_TRANSACTION
+    }
+
+    #[cfg(feature = "unstable")]
+    #[unsafe(no_mangle)]
+    pub extern "C" fn procedure_http_request(
+        _request_ptr: *const u8,
+        _request_len: u32,
+        _body_ptr: *const u8,
+        _body_len: u32,
+        _out: *mut [BytesSource; 2],
+    ) -> u16 {
+        NOT_IN_TRANSACTION
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn datastore_index_scan_point_bsatn(
+        _index_id: IndexId,
+        _point_ptr: *const u8,
+        _point_len: usize,
+        _out: *mut RowIter,
+    ) -> u16 {
+        NOT_IN_TRANSACTION
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn datastore_delete_by_index_scan_point_bsatn(
+        _index_id: IndexId,
+        _point_ptr: *const u8,
+        _point_len: usize,
+        _out: *mut u32,
+    ) -> u16 {
+        NOT_IN_TRANSACTION
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn datastore_clear(_table_id: TableId, _out: *mut u64) -> u16 {
+        NOT_IN_TRANSACTION
     }
 }
 
@@ -1072,7 +1368,6 @@ unsafe fn call<T: Copy>(f: impl FnOnce(*mut T) -> u16) -> Result<T> {
 /// Assuming the call to `f` returns 0, `Ok(())` is returned,
 /// and otherwise `Err(err)` is returned.
 #[inline]
-#[cfg(feature = "unstable")]
 fn call_no_ret(f: impl FnOnce() -> u16) -> Result<()> {
     let f_code = f();
     cvt(f_code)?;
@@ -1496,6 +1791,14 @@ pub fn get_jwt(connection_id: [u8; 16]) -> Option<raw::BytesSource> {
     }
 }
 
+/// Read a database environment value without exposing the system table.
+#[inline]
+pub fn env_get(key: &str) -> Option<raw::BytesSource> {
+    let source = unsafe { call(|out| raw::env_get(key.as_ptr(), key.len(), out)) }
+        .unwrap_or_else(|errno: Errno| panic!("Error reading environment: {errno}"));
+    (source != raw::BytesSource::INVALID).then_some(source)
+}
+
 pub struct RowIter {
     raw: raw::RowIter,
 }
@@ -1548,7 +1851,6 @@ impl Drop for RowIter {
     }
 }
 
-#[cfg(feature = "unstable")]
 pub mod procedure {
     //! Side-effecting or asynchronous operations which only procedures are allowed to perform.
 
@@ -1566,7 +1868,7 @@ pub mod procedure {
     ///
     /// Once complete, returns `Ok(timestamp)` on success,
     /// enabling further calls that require a pending transaction,
-    /// or [`Errno`] otherwise.
+    /// or [`crate::Errno`] otherwise.
     ///
     /// # Errors
     ///
@@ -1582,7 +1884,7 @@ pub mod procedure {
     /// blocking until the transaction has been committed
     /// and subscription queries have been run and broadcast.
     ///
-    /// Once complete, returns `Ok(())` on success, or an [`Errno`] otherwise.
+    /// Once complete, returns `Ok(())` on success, or an [`crate::Errno`] otherwise.
     ///
     /// # Errors
     ///
@@ -1604,7 +1906,7 @@ pub mod procedure {
     /// Aborts a mutable transaction,
     /// blocking until the transaction has been rolled back.
     ///
-    /// Once complete, returns `Ok(())` on success, or an [`Errno`] otherwise.
+    /// Once complete, returns `Ok(())` on success, or an [`crate::Errno`] otherwise.
     ///
     /// # Errors
     ///
@@ -1624,7 +1926,6 @@ pub mod procedure {
     }
 
     #[inline]
-    #[cfg(feature = "unstable")]
     /// Perform an HTTP request as specified by `http_request_bsatn`,
     /// suspending execution until the request is complete,
     /// then return its response or error.

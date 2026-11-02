@@ -46,8 +46,17 @@ spacetime dev
 spacetime dev --client-lang typescript --module-bindings-path ./client/src/module_bindings
 
 # Generate client bindings
-spacetime generate --lang typescript|csharp|rust|unrealcpp --out-dir ./bindings --module-path ./server
+spacetime generate --lang typescript|csharp|rust --out-dir ./bindings --module-path ./server
+spacetime generate --lang unrealcpp --uproject-dir ./MyGame --module-path ./server --unreal-module-name MyGame
 ```
+
+### Client and Module Bindings
+
+`spacetime generate --bindings client` (default) generates bindings for clients connecting to a database. `--bindings module` generates receiver bindings used inside a **sending database module** to call reducers in another **receiving database** through asynchronous IDC. Rust and TypeScript module bindings are supported; C#/C++ module bindings are not implemented yet. `unrealcpp` is client-only; `cpp` is accepted only in module mode.
+
+In `spacetime.json`, each sending database's non-inherited `dependencies` array requires its own `module-path` and dependency `name` plus receiving-module `module-path` or `database`. A `database` reference resolves another target's local source/build settings in the same config; it does not fetch a running database's schema. A direct receiving module source takes precedence. Dependencies do not themselves publish receiving databases or inherit the sending module's build settings. `generate <sending-database>` processes both its regular `generate` entries (client bindings by default) and `dependencies` (module bindings automatically); no `--bindings` flag or second `generate` entry is needed for a dependency. For dependencies, module binding language defaults to the sending module's language and Rust/TypeScript output defaults to `<sending module-path>/src/remote_bindings`. Explicit config `out-dir` is config-relative. A regular `generate` entry can select `"bindings": "module"`, but does not use dependency language or output defaults. The CLI `--bindings` override is allowed only when a single generation entry is selected.
+
+`dev` generates only root dependencies before building the sending module, and watches their source paths. Child targets are available for source lookup, not recursive dependency generation. `--skip-generate` skips receiver/client generation and receiver-only watching; `--skip-publish` does not. See https://spacetimedb.com/docs/cli-reference/spacetime-json#receiver-dependencies for examples.
 
 ### Publishing & Deployment
 
@@ -59,7 +68,7 @@ spacetime publish my-database --yes
 spacetime publish my-database --server local --yes
 
 # Clear database and republish
-spacetime publish my-database --delete-data always --yes
+spacetime publish my-database --delete-data=always --yes
 ```
 
 ### Database Interaction
@@ -80,9 +89,11 @@ spacetime logs my-database -f              # follow logs
 spacetime logs my-database -n 100          # up to 100 log lines
 
 # Describe schema
+# (without --json, output is human-readable text)
 spacetime describe my-database --json
-spacetime describe my-database table users --json
-spacetime describe my-database reducer my_reducer --json
+spacetime describe my-database tables --json   # also views, reducers, procedures, routes, env, types
+spacetime describe my-database tables users --json
+spacetime describe my-database reducers my_reducer --json
 ```
 
 ### Database Management
@@ -152,6 +163,7 @@ spacetime logout
 | `--yes` | `-y` | Non-interactive mode (skip confirmations) |
 | `--anonymous` | | Use anonymous identity |
 | `--module-path` | `-p` | Path to module project |
+| `--no-config` | | Ignore `spacetime.json` project configuration |
 
 ## Troubleshooting
 
@@ -170,7 +182,7 @@ spacetime server ping <server>
 ### "Schema conflict"
 ```bash
 # Clear data and republish
-spacetime publish my-db --delete-data always --yes
+spacetime publish my-db --delete-data=always --yes
 ```
 
 ### "Build failed"
@@ -186,4 +198,3 @@ rustup target add wasm32-unknown-unknown
 **Server-side (modules):** Rust, C#, TypeScript, C++
 **Client SDKs:** TypeScript, C#, Rust, Unreal Engine
 **CLI `generate` targets:** TypeScript, C#, Rust, Unreal C++
-

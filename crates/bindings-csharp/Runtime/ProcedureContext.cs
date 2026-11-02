@@ -1,21 +1,15 @@
 namespace SpacetimeDB;
 
-using System.Diagnostics.CodeAnalysis;
-
 #pragma warning disable STDB_UNSTABLE
-public abstract class ProcedureContextBase(
-    Identity sender,
-    ConnectionId? connectionId,
-    Random random,
-    Timestamp time
-) : Internal.IInternalProcedureContext
+public abstract class ProcedureContextBase : Internal.IInternalProcedureContext
 {
+    public DatabaseEnvironment Env { get; } = DatabaseEnvironment.Instance;
     public static Identity Identity => Internal.IProcedureContext.GetIdentity();
-    public Identity Sender { get; } = sender;
-    public ConnectionId? ConnectionId { get; } = connectionId;
-    public Random Rng { get; } = random;
-    public Timestamp Timestamp { get; private set; } = time;
-    public AuthCtx SenderAuth { get; } = AuthCtx.BuildFromSystemTables(connectionId, sender);
+    public Identity Sender { get; }
+    public ConnectionId? ConnectionId { get; }
+    public Random Rng => txState.Rng;
+    public Timestamp Timestamp => txState.Timestamp;
+    public AuthCtx SenderAuth { get; }
 
     // NOTE: The host rejects procedure HTTP requests while a mut transaction is open
     // (WOULD_BLOCK_TRANSACTION). Avoid calling `Http.*` inside WithTx.
@@ -23,40 +17,57 @@ public abstract class ProcedureContextBase(
 
     // **Note:** must be 0..=u32::MAX
     protected int CounterUuid = 0;
-    private Internal.TxContext? txContext;
-    private ProcedureTxContextBase? cachedUserTxContext;
+#if NET10_0_OR_GREATER
+    private protected ProcedureContextBase? SelectionSource;
+    protected ref int SharedCounterUuid => ref (SelectionSource ?? this).CounterUuid;
 
-    protected abstract ProcedureTxContextBase CreateTxContext(Internal.TxContext inner);
-    protected internal abstract LocalBase CreateLocal();
+    protected virtual ProcedureTxContextBase SelectTxContext(ProcedureTxContextBase tx) => tx;
 
-    private protected ProcedureTxContextBase RequireTxContext()
+    // Keep captured callbacks off the ordinary, unselected transaction path.
+    private TResult WithSelectedTx<TResult>(Func<ProcedureTxContextBase, TResult> body) =>
+        SelectionSource!.WithTx(tx => body(SelectTxContext(tx)));
+
+    private TxOutcome<TResult> TryWithSelectedTx<TResult, TError>(
+        Func<ProcedureTxContextBase, Result<TResult, TError>> body
+    )
+        where TError : Exception =>
+        SelectionSource!.TryWithTx<TResult, TError>(tx => body(SelectTxContext(tx)));
+#endif
+
+    private readonly TransactionalContextState<ProcedureTxContextBase> txState;
+
+    protected ProcedureContextBase(
+        Identity sender,
+        ConnectionId? connectionId,
+        Random random,
+        Timestamp time
+    )
     {
-        var inner =
-            txContext
-            ?? throw new InvalidOperationException("Transaction context was not initialised.");
-        cachedUserTxContext ??= CreateTxContext(inner);
-        cachedUserTxContext.Refresh(inner);
-        return cachedUserTxContext;
-    }
-
-    public Internal.TxContext EnterTxContext(long timestampMicros)
-    {
-        var timestamp = new Timestamp(timestampMicros);
-        Timestamp = timestamp;
-        txContext =
-            txContext?.WithTimestamp(timestamp)
-            ?? new Internal.TxContext(
+        Sender = sender;
+        ConnectionId = connectionId;
+        SenderAuth = AuthCtx.BuildFromSystemTables(connectionId, sender);
+        txState = new(
+            random,
+            time,
+            timestamp => new Internal.TxContext(
                 CreateLocal(),
                 Sender,
                 ConnectionId,
                 timestamp,
                 SenderAuth,
-                Rng
-            );
-        return txContext;
+                random
+            ),
+            inner => CreateTxContext(inner)
+        );
     }
 
-    public void ExitTxContext() => txContext = null;
+    protected abstract ProcedureTxContextBase CreateTxContext(Internal.TxContext inner);
+    protected internal abstract LocalBase CreateLocal();
+
+    public Internal.TxContext EnterTxContext(long timestampMicros) =>
+        txState.EnterTxContext(timestampMicros);
+
+    public void ExitTxContext() => txState.ExitTxContext();
 
     public readonly struct TxOutcome<TResult>(bool isSuccess, TResult? value, Exception? error)
     {
@@ -80,156 +91,67 @@ public abstract class ProcedureContextBase(
             IsSuccess ? Value! : throw (Error ?? fallbackFactory());
     }
 
-    [Experimental("STDB_UNSTABLE")]
-    public TResult WithTx<TResult>(Func<ProcedureTxContextBase, TResult> body) =>
-        TryWithTx(tx => Result<TResult, Exception>.Ok(body(tx))).UnwrapOrThrow();
+    public TResult WithTx<TResult>(Func<ProcedureTxContextBase, TResult> body)
+    {
+#if NET10_0_OR_GREATER
+        if (SelectionSource is not null)
+        {
+            return WithSelectedTx(body);
+        }
+#endif
+        return txState.WithTx(body);
+    }
 
-    [Experimental("STDB_UNSTABLE")]
     public TxOutcome<TResult> TryWithTx<TResult, TError>(
         Func<ProcedureTxContextBase, Result<TResult, TError>> body
     )
         where TError : Exception
     {
-        try
+#if NET10_0_OR_GREATER
+        if (SelectionSource is not null)
         {
-            var result = RunWithRetry(body);
-
-            return result switch
-            {
-                Result<TResult, TError>.OkR(var value) => TxOutcome<TResult>.Success(value),
-                Result<TResult, TError>.ErrR(var error) => TxOutcome<TResult>.Failure(error),
-                _ => throw new InvalidOperationException("Unknown Result variant."),
-            };
+            return TryWithSelectedTx<TResult, TError>(body);
         }
-        catch (Exception ex)
-        {
-            return TxOutcome<TResult>.Failure(ex);
-        }
-    }
-
-    // Private transaction management methods (Rust-like encapsulation)
-    private long StartMutTx()
-    {
-        var status = Internal.FFI.procedure_start_mut_tx(out var micros);
-        Internal.FFI.ErrnoHelpers.ThrowIfError(status);
-        return micros;
-    }
-
-    private void CommitMutTx()
-    {
-        var status = Internal.FFI.procedure_commit_mut_tx();
-        Internal.FFI.ErrnoHelpers.ThrowIfError(status);
-    }
-
-    private void AbortMutTx()
-    {
-        var status = Internal.FFI.procedure_abort_mut_tx();
-        Internal.FFI.ErrnoHelpers.ThrowIfError(status);
-    }
-
-    private bool CommitMutTxWithRetry(Func<bool> retryBody)
-    {
-        try
-        {
-            CommitMutTx();
-            return true;
-        }
-        catch (TransactionNotAnonymousException)
-        {
-            return false;
-        }
-        catch (StdbException)
-        {
-            Log.Warn("Committing anonymous transaction failed; retrying once.");
-            if (retryBody())
-            {
-                CommitMutTx();
-                return true;
-            }
-            return false;
-        }
-    }
-
-    private Result<TResult, TError> RunWithRetry<TResult, TError>(
-        Func<ProcedureTxContextBase, Result<TResult, TError>> body
-    )
-        where TError : Exception
-    {
-        var result = RunOnce(body);
-        if (result is Result<TResult, TError>.ErrR)
-        {
-            return result;
-        }
-
-        bool Retry()
-        {
-            result = RunOnce(body);
-            return result is Result<TResult, TError>.OkR;
-        }
-
-        if (!CommitMutTxWithRetry(Retry))
-        {
-            return result;
-        }
-
-        return result;
-    }
-
-    private Result<TResult, TError> RunOnce<TResult, TError>(
-        Func<ProcedureTxContextBase, Result<TResult, TError>> body
-    )
-        where TError : Exception
-    {
-        var micros = StartMutTx();
-        using var guard = new AbortGuard(AbortMutTx);
-        EnterTxContext(micros);
-        var txCtx = RequireTxContext();
-
-        Result<TResult, TError> result;
-        try
-        {
-            result = body(txCtx);
-        }
-        catch (Exception)
-        {
-            throw;
-        }
-
-        if (result is Result<TResult, TError>.OkR)
-        {
-            guard.Disarm();
-            return result;
-        }
-
-        AbortMutTx();
-        guard.Disarm();
-        return result;
-    }
-
-    private sealed class AbortGuard(Action abort) : IDisposable
-    {
-        private readonly Action abort = abort;
-        private bool disarmed;
-
-        public void Disarm() => disarmed = true;
-
-        public void Dispose()
-        {
-            if (!disarmed)
-            {
-                abort();
-            }
-        }
+#endif
+        var outcome = txState.TryWithTx(body);
+        return outcome.IsSuccess
+            ? TxOutcome<TResult>.Success(outcome.Value!)
+            : TxOutcome<TResult>.Failure(
+                outcome.Error
+                    ?? new InvalidOperationException("Transaction failed without an error object.")
+            );
     }
 }
 
-public abstract class ProcedureTxContextBase(Internal.TxContext inner)
+public abstract class ProcedureTxContextBase(Internal.TxContext inner) : IRefreshableTxContext
 {
+#if NET10_0_OR_GREATER
+    private protected ProcedureTxContextBase? SelectionSource;
+    private protected LocalBase LocalDb = (LocalBase)inner.Db;
+    private Internal.TxContext currentInner = inner;
+
+    // Selected wrappers must observe refreshes of the original transaction context.
+    internal Internal.TxContext Inner => SelectionSource?.Inner ?? currentInner;
+
+    internal void Refresh(Internal.TxContext inner)
+    {
+        currentInner = inner;
+        LocalDb = (LocalBase)inner.Db;
+    }
+#else
     internal Internal.TxContext Inner { get; private set; } = inner;
 
     internal void Refresh(Internal.TxContext inner) => Inner = inner;
+#endif
 
+    void IRefreshableTxContext.Refresh(Internal.TxContext inner) => Refresh(inner);
+
+#if NET10_0_OR_GREATER
+    public LocalBase Db => LocalDb;
+#else
     public LocalBase Db => (LocalBase)Inner.Db;
+#endif
+    public DatabaseEnvironment Env { get; } = DatabaseEnvironment.Instance;
     public Identity Sender => Inner.Sender;
     public ConnectionId? ConnectionId => Inner.ConnectionId;
     public Timestamp Timestamp => Inner.Timestamp;

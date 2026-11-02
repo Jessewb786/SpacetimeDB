@@ -6,6 +6,7 @@
 //! It allows easier future extensibility to add new kinds of definitions.
 
 use crate::db::raw_def::v9::{Lifecycle, RawIndexAlgorithm, TableAccess, TableType};
+use crate::Hash;
 use core::fmt;
 use spacetimedb_primitives::{ColId, ColList};
 use spacetimedb_sats::raw_identifier::RawIdentifier;
@@ -90,16 +91,79 @@ pub enum RawModuleDefV10Section {
     /// Names provided explicitly by the user that do not follow from the case conversion policy.
     ExplicitNames(ExplicitNames),
 
-    /// Mounted submodules, keyed by the namespace they are mounted under.
-    Mounts(Vec<RawModuleMountV10>),
+    /// HTTP handler function definitions.
+    HttpHandlers(Vec<RawHttpHandlerDefV10>),
+
+    /// HTTP route definitions.
+    HttpRoutes(Vec<RawHttpRouteDefV10>),
+
+    /// Primary key metadata for views.
+    ViewPrimaryKeys(Vec<RawViewPrimaryKeyDefV10>),
+
+    /// Submodules, keyed by the namespace they are registered under.
+    Submodules(Vec<RawSubmoduleV10>),
+
+    /// Declared publish-only configuration. Even an empty section requires ENV support.
+    Environment(Vec<RawEnvironmentDeclarationV10>),
+
+    /// Outbox table definitions.
+    Outboxes(Vec<RawOutboxDefV10>),
 }
 
 #[derive(Debug, Clone, SpacetimeType)]
 #[sats(crate = crate)]
 #[cfg_attr(feature = "test", derive(PartialEq, Eq, PartialOrd, Ord))]
-pub struct RawModuleMountV10 {
+pub struct RawHttpHandlerDefV10 {
+    pub source_name: RawIdentifier,
+}
+
+#[derive(Debug, Clone, SpacetimeType)]
+#[sats(crate = crate)]
+#[cfg_attr(feature = "test", derive(PartialEq, Eq, PartialOrd, Ord))]
+pub struct RawHttpRouteDefV10 {
+    pub handler_function: RawIdentifier,
+    pub method: MethodOrAny,
+    pub path: RawIdentifier,
+}
+
+#[derive(Debug, Clone, SpacetimeType, PartialEq, Eq, PartialOrd, Ord)]
+#[sats(crate = crate)]
+#[non_exhaustive]
+pub enum MethodOrAny {
+    Any,
+    Method(crate::http::Method),
+}
+
+#[derive(Debug, Clone, SpacetimeType)]
+#[sats(crate = crate)]
+#[cfg_attr(feature = "test", derive(PartialEq, Eq, PartialOrd, Ord))]
+pub struct RawSubmoduleV10 {
+    /// The namespace as written in the parent module's source, aka the accessor name.
+    ///
+    /// The canonical namespace stored in the database is derived during validation,
+    /// exactly like table names: the parent module's [`CaseConversionPolicy`] is
+    /// applied unless an [`ExplicitNameEntry::Namespace`] mapping for this accessor
+    /// name overrides it.
     pub namespace: String,
     pub module: RawModuleDefV10,
+}
+
+#[derive(Debug, Clone, crate::SpacetimeType)]
+#[sats(crate = crate)]
+#[cfg_attr(feature = "test", derive(PartialEq, Eq, PartialOrd, Ord))]
+pub enum RawEnvVarTypeV10 {
+    String,
+    StringLiteral(String),
+    Union(Vec<String>),
+}
+
+#[derive(Debug, Clone, crate::SpacetimeType)]
+#[sats(crate = crate)]
+#[cfg_attr(feature = "test", derive(PartialEq, Eq, PartialOrd, Ord))]
+pub struct RawEnvironmentDeclarationV10 {
+    pub name: String,
+    pub ty: RawEnvVarTypeV10,
+    pub optional: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, SpacetimeType)]
@@ -125,6 +189,7 @@ pub struct NameMapping {
     /// - Tables: value from `#[spacetimedb::table(accessor = ...)]`.
     /// - Reducers/Procedures/Views: function name
     /// - Indexes: `{table_name}_{column_names}_idx_{algorithm}`
+    /// - Namespaces: the key a submodule is mounted under
     ///
     /// During validation, this may be replaced by `canonical_name`
     /// if an explicit or policy-based name is applied.
@@ -150,6 +215,7 @@ pub enum ExplicitNameEntry {
     Table(NameMapping),
     Function(NameMapping),
     Index(NameMapping),
+    Namespace(NameMapping),
 }
 
 #[derive(Debug, Default, Clone, SpacetimeType)]
@@ -185,6 +251,17 @@ impl ExplicitNames {
 
     pub fn insert_index(&mut self, source_name: impl Into<RawIdentifier>, canonical_name: impl Into<RawIdentifier>) {
         self.insert(ExplicitNameEntry::Index(NameMapping {
+            source_name: source_name.into(),
+            canonical_name: canonical_name.into(),
+        }));
+    }
+
+    pub fn insert_namespace(
+        &mut self,
+        source_name: impl Into<RawIdentifier>,
+        canonical_name: impl Into<RawIdentifier>,
+    ) {
+        self.insert(ExplicitNameEntry::Namespace(NameMapping {
             source_name: source_name.into(),
             canonical_name: canonical_name.into(),
         }));
@@ -273,6 +350,25 @@ pub struct RawColumnDefaultValueV10 {
     /// A BSATN-encoded [`AlgebraicValue`] valid at the column's type.
     /// (We cannot use `AlgebraicValue` directly as it isn't `SpacetimeType`.)
     pub value: Box<[u8]>,
+}
+
+/// Marks a table as an IDC outbox table.
+#[derive(Debug, Clone, SpacetimeType)]
+#[sats(crate = crate)]
+#[cfg_attr(feature = "test", derive(PartialEq, Eq, PartialOrd, Ord))]
+pub struct RawOutboxDefV10 {
+    /// The `source_name` of the outbox table.
+    pub table_name: RawIdentifier,
+    /// The reducer to call on the target database.
+    pub remote_reducer: RawIdentifier,
+    /// Column containing the receiver database identity.
+    pub target_column: ColId,
+    /// Columns to encode as reducer arguments, in receiver parameter order.
+    pub arg_columns: Vec<ColId>,
+    /// Optional local reducer called with the delivery result.
+    pub on_result_reducer: Option<RawIdentifier>,
+    /// Hash of the receiver reducer signature as seen by sender bindings.
+    pub signature_hash: Hash,
 }
 
 /// A reducer definition.
@@ -384,20 +480,16 @@ pub struct RawSequenceDefV10 {
     /// This must be the unique `RawSequenceDef` for this column.
     pub column: ColId,
 
-    /// The value to start assigning to this column.
-    /// Will be incremented by 1 for each new row.
-    /// If not present, an arbitrary start point may be selected.
+    /// Deprecated; should be `None`.
     pub start: Option<i128>,
 
-    /// The minimum allowed value in this column.
-    /// If not present, no minimum.
+    /// Deprecated; should be `None`.
     pub min_value: Option<i128>,
 
-    /// The maximum allowed value in this column.
-    /// If not present, no maximum.
+    /// Deprecated; should be `None`.
     pub max_value: Option<i128>,
 
-    /// The increment used when updating the SequenceDef.
+    /// Deprecated; should be `1i128`.
     pub increment: i128,
 }
 
@@ -520,11 +612,26 @@ pub struct RawViewDefV10 {
     pub return_type: AlgebraicType,
 }
 
+/// Primary key metadata for a view.
+#[derive(Debug, Clone, SpacetimeType)]
+#[sats(crate = crate)]
+#[cfg_attr(feature = "test", derive(PartialEq, Eq, PartialOrd, Ord))]
+pub struct RawViewPrimaryKeyDefV10 {
+    /// The source/accessor name of the view this primary key applies to.
+    pub view_source_name: RawIdentifier,
+
+    /// The source/accessor names of the columns that make up the primary key.
+    ///
+    /// Currently only a single column is supported, but this is a vector to keep
+    /// the raw definition compatible with future composite view primary keys.
+    pub columns: Vec<RawIdentifier>,
+}
+
 impl RawModuleDefV10 {
-    /// Get the mounted submodules for this module definition.
-    pub fn mounts(&self) -> Option<&Vec<RawModuleMountV10>> {
+    /// Get the submodules for this module definition.
+    pub fn submodules(&self) -> Option<&Vec<RawSubmoduleV10>> {
         self.sections.iter().find_map(|s| match s {
-            RawModuleDefV10Section::Mounts(mounts) => Some(mounts),
+            RawModuleDefV10Section::Submodules(submodules) => Some(submodules),
             _ => None,
         })
     }
@@ -577,6 +684,14 @@ impl RawModuleDefV10 {
         })
     }
 
+    /// Get the view primary keys section, if present.
+    pub fn view_primary_keys(&self) -> Option<&Vec<RawViewPrimaryKeyDefV10>> {
+        self.sections.iter().find_map(|s| match s {
+            RawModuleDefV10Section::ViewPrimaryKeys(primary_keys) => Some(primary_keys),
+            _ => None,
+        })
+    }
+
     /// Get the schedules section, if present.
     pub fn schedules(&self) -> Option<&Vec<RawScheduleDefV10>> {
         self.sections.iter().find_map(|s| match s {
@@ -603,6 +718,14 @@ impl RawModuleDefV10 {
             .expect("Tables section must exist for tests")
     }
 
+    /// Get the outboxes section, if present.
+    pub fn outboxes(&self) -> Option<&Vec<RawOutboxDefV10>> {
+        self.sections.iter().find_map(|s| match s {
+            RawModuleDefV10Section::Outboxes(outboxes) => Some(outboxes),
+            _ => None,
+        })
+    }
+
     // Get the row-level security section, if present.
     pub fn row_level_security(&self) -> Option<&Vec<RawRowLevelSecurityDefV10>> {
         self.sections.iter().find_map(|s| match s {
@@ -624,6 +747,20 @@ impl RawModuleDefV10 {
     pub fn explicit_names(&self) -> Option<&ExplicitNames> {
         self.sections.iter().find_map(|s| match s {
             RawModuleDefV10Section::ExplicitNames(names) => Some(names),
+            _ => None,
+        })
+    }
+
+    pub fn http_handlers(&self) -> Option<&Vec<RawHttpHandlerDefV10>> {
+        self.sections.iter().find_map(|s| match s {
+            RawModuleDefV10Section::HttpHandlers(handlers) => Some(handlers),
+            _ => None,
+        })
+    }
+
+    pub fn http_routes(&self) -> Option<&Vec<RawHttpRouteDefV10>> {
+        self.sections.iter().find_map(|s| match s {
+            RawModuleDefV10Section::HttpRoutes(routes) => Some(routes),
             _ => None,
         })
     }
@@ -718,6 +855,26 @@ impl RawModuleDefV10Builder {
         match &mut self.module.sections[idx] {
             RawModuleDefV10Section::Views(views) => views,
             _ => unreachable!("Just ensured Views section exists"),
+        }
+    }
+
+    /// Get mutable access to the view primary keys section, creating it if missing.
+    fn view_primary_keys_mut(&mut self) -> &mut Vec<RawViewPrimaryKeyDefV10> {
+        let idx = self
+            .module
+            .sections
+            .iter()
+            .position(|s| matches!(s, RawModuleDefV10Section::ViewPrimaryKeys(_)))
+            .unwrap_or_else(|| {
+                self.module
+                    .sections
+                    .push(RawModuleDefV10Section::ViewPrimaryKeys(Vec::new()));
+                self.module.sections.len() - 1
+            });
+
+        match &mut self.module.sections[idx] {
+            RawModuleDefV10Section::ViewPrimaryKeys(primary_keys) => primary_keys,
+            _ => unreachable!("Just ensured ViewPrimaryKeys section exists"),
         }
     }
 
@@ -821,6 +978,84 @@ impl RawModuleDefV10Builder {
         match &mut self.module.sections[idx] {
             RawModuleDefV10Section::ExplicitNames(names) => names,
             _ => unreachable!("Just ensured ExplicitNames section exists"),
+        }
+    }
+
+    /// Get mutable access to the HTTP handlers section, creating it if missing.
+    fn http_handlers_mut(&mut self) -> &mut Vec<RawHttpHandlerDefV10> {
+        let idx = self
+            .module
+            .sections
+            .iter()
+            .position(|s| matches!(s, RawModuleDefV10Section::HttpHandlers(_)))
+            .unwrap_or_else(|| {
+                self.module
+                    .sections
+                    .push(RawModuleDefV10Section::HttpHandlers(Vec::new()));
+                self.module.sections.len() - 1
+            });
+
+        match &mut self.module.sections[idx] {
+            RawModuleDefV10Section::HttpHandlers(handlers) => handlers,
+            _ => unreachable!("Just ensured HttpHandlers section exists"),
+        }
+    }
+
+    /// Get mutable access to the HTTP routes section, creating it if missing.
+    fn http_routes_mut(&mut self) -> &mut Vec<RawHttpRouteDefV10> {
+        let idx = self
+            .module
+            .sections
+            .iter()
+            .position(|s| matches!(s, RawModuleDefV10Section::HttpRoutes(_)))
+            .unwrap_or_else(|| {
+                self.module
+                    .sections
+                    .push(RawModuleDefV10Section::HttpRoutes(Vec::new()));
+                self.module.sections.len() - 1
+            });
+
+        match &mut self.module.sections[idx] {
+            RawModuleDefV10Section::HttpRoutes(routes) => routes,
+            _ => unreachable!("Just ensured HttpRoutes section exists"),
+        }
+    }
+
+    /// Get mutable access to the outboxes section, creating it if missing.
+    fn outboxes_mut(&mut self) -> &mut Vec<RawOutboxDefV10> {
+        let idx = self
+            .module
+            .sections
+            .iter()
+            .position(|s| matches!(s, RawModuleDefV10Section::Outboxes(_)))
+            .unwrap_or_else(|| {
+                self.module.sections.push(RawModuleDefV10Section::Outboxes(Vec::new()));
+                self.module.sections.len() - 1
+            });
+
+        match &mut self.module.sections[idx] {
+            RawModuleDefV10Section::Outboxes(outboxes) => outboxes,
+            _ => unreachable!("Just ensured Outboxes section exists"),
+        }
+    }
+
+    /// Get mutable access to the environment section, creating it if missing.
+    fn environment_mut(&mut self) -> &mut Vec<RawEnvironmentDeclarationV10> {
+        let idx = self
+            .module
+            .sections
+            .iter()
+            .position(|s| matches!(s, RawModuleDefV10Section::Environment(_)))
+            .unwrap_or_else(|| {
+                self.module
+                    .sections
+                    .push(RawModuleDefV10Section::Environment(Vec::new()));
+                self.module.sections.len() - 1
+            });
+
+        match &mut self.module.sections[idx] {
+            RawModuleDefV10Section::Environment(env) => env,
+            _ => unreachable!("Just ensured Environment section exists"),
         }
     }
 
@@ -1015,6 +1250,18 @@ impl RawModuleDefV10Builder {
         });
     }
 
+    /// Add primary key metadata for a view.
+    pub fn add_view_primary_key<C, I>(&mut self, view_source_name: impl Into<RawIdentifier>, columns: I)
+    where
+        C: Into<RawIdentifier>,
+        I: IntoIterator<Item = C>,
+    {
+        self.view_primary_keys_mut().push(RawViewPrimaryKeyDefV10 {
+            view_source_name: view_source_name.into(),
+            columns: columns.into_iter().map(Into::into).collect(),
+        });
+    }
+
     /// Add a lifecycle reducer assignment to the module.
     ///
     /// The function must be a previously-added reducer.
@@ -1069,8 +1316,89 @@ impl RawModuleDefV10Builder {
             .push(RawRowLevelSecurityDefV10 { sql: sql.into() });
     }
 
+    /// Add an HTTP handler to the module.
+    pub fn add_http_handler(&mut self, source_name: impl Into<RawIdentifier>) {
+        self.http_handlers_mut().push(RawHttpHandlerDefV10 {
+            source_name: source_name.into(),
+        });
+    }
+
+    /// Add an HTTP route to the module.
+    pub fn add_http_route(
+        &mut self,
+        handler_function: impl Into<RawIdentifier>,
+        method: MethodOrAny,
+        path: impl Into<RawIdentifier>,
+    ) {
+        self.http_routes_mut().push(RawHttpRouteDefV10 {
+            handler_function: handler_function.into(),
+            method,
+            path: path.into(),
+        });
+    }
+
     pub fn add_explicit_names(&mut self, names: ExplicitNames) {
         self.explicit_names_mut().merge(names);
+    }
+
+    /// Register an IDC outbox table.
+    pub fn add_outbox(
+        &mut self,
+        table_name: impl Into<RawIdentifier>,
+        remote_reducer: impl Into<RawIdentifier>,
+        target_column: impl Into<ColId>,
+        arg_columns: impl IntoIterator<Item = ColId>,
+        on_result_reducer: Option<impl Into<RawIdentifier>>,
+        signature_hash: Hash,
+    ) {
+        self.outboxes_mut().push(RawOutboxDefV10 {
+            table_name: table_name.into(),
+            remote_reducer: remote_reducer.into(),
+            target_column: target_column.into(),
+            arg_columns: arg_columns.into_iter().collect(),
+            on_result_reducer: on_result_reducer.map(Into::into),
+            signature_hash,
+        });
+    }
+
+    pub fn set_outbox_on_result(
+        &mut self,
+        table_name: impl Into<RawIdentifier>,
+        on_result_reducer: impl Into<RawIdentifier>,
+    ) {
+        let table_name = table_name.into();
+        let on_result_reducer = Some(on_result_reducer.into());
+        if let Some(outbox) = self
+            .outboxes_mut()
+            .iter_mut()
+            .find(|outbox| outbox.table_name == table_name)
+        {
+            assert!(
+                outbox.on_result_reducer.is_none(),
+                "outbox table `{table_name}` has multiple on_result reducers"
+            );
+            outbox.on_result_reducer = on_result_reducer;
+        } else {
+            panic!("on_result reducer references unknown outbox table `{table_name}`");
+        }
+    }
+
+    pub fn add_submodule(&mut self, namespace: impl Into<String>, module: RawModuleDefV10) {
+        let submodule = RawSubmoduleV10 {
+            namespace: namespace.into(),
+            module,
+        };
+        let existing = self.module.sections.iter_mut().find_map(|s| match s {
+            RawModuleDefV10Section::Submodules(submodules) => Some(submodules),
+            _ => None,
+        });
+        match existing {
+            Some(submodules) => submodules.push(submodule),
+            None => self
+                .module
+                .sections
+                .push(RawModuleDefV10Section::Submodules(vec![submodule])),
+        }
     }
 
     /// Set the case conversion policy for this module.
@@ -1087,6 +1415,12 @@ impl RawModuleDefV10Builder {
         self.module
             .sections
             .push(RawModuleDefV10Section::CaseConversionPolicy(policy));
+    }
+
+    /// Declare a complete environment schema.
+    pub fn add_environment(&mut self, declarations: Vec<RawEnvironmentDeclarationV10>) -> &mut Self {
+        self.environment_mut().extend(declarations);
+        self
     }
 
     /// Finish building, consuming the builder and returning the module.

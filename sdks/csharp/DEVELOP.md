@@ -4,7 +4,7 @@ We are in the process of moving from the `com.clockworklabs.spacetimedbsdk` repo
 
 # Notes for maintainers
 
-First, see the [user-facing docs](https://spacetimedb.com/docs/sdks/c-sharp).
+First, see the [user-facing docs](https://spacetimedb.com/docs/clients/c-sharp).
 
 ## Developing against a local clone of SpacetimeDB
 When developing against a local clone of SpacetimeDB, you'll need to ensure that the packages here can find an up-to-date version of the BSATN.Codegen and BSATN.Runtime packages from SpacetimeDB.
@@ -48,6 +48,35 @@ When SDK code needs to refer to generated types, we have two options:
 
 The most important generated types are `RemoteTables` -- also known as the **client cache** -- and `RemoteReducers`. `RemoteTables` stores the local view of subscribed data from the database. For a `DbConnection conn`, `conn.Db` is an instance of `RemoteTables`. `RemoteReducers` allows calling reducers on the server, and is accessible at `conn.Reducers`. Types are also generated for all server-side types referred to by tables or modules.
 
+### Namespace bindings
+
+Suppose a dependency is mounted with `Accessor = "MyAuth", Name = "auth_data"`.
+Generated C# clients expose its tables through
+`conn.Db.MyAuth`, reducers through `conn.Reducers.MyAuth`, procedures through
+`conn.Procedures.MyAuth`, and query factories through `q.From.MyAuth`.
+Generated SQL and network messages use the database namespace `auth_data`.
+The C# accessor remains `MyAuth`. When `Name` is omitted, the host derives the
+database namespace from the accessor using the containing module's case policy.
+
+The `--namespace` option of `spacetime generate` controls where generated C#
+classes are declared; it does not name or rename database namespaces. With
+`--namespace Game.Bindings`, a root `User` row becomes `Game.Bindings.User`,
+while a `User` row in that dependency becomes
+`Game.Bindings.MyAuth.User`. Their table handles remain `conn.Db.User` and
+`conn.Db.MyAuth.User`, respectively.
+
+Nested submodules follow the same pattern at every level:
+`conn.Db.Auth.Audit.User`, `conn.Reducers.Auth.Audit.Login(...)`,
+`conn.Procedures.Auth.Audit.Count(...)`, and `q.From.Auth.Audit.User()`.
+All containers share one connection and table registry. Generated SQL quotes
+each canonical namespace segment separately; accessors are never substituted
+for canonical names. `SqlTableName(string[], string)` supports these paths while
+the existing string constructors continue to treat dots as literal identifier
+characters. Qualified names are cached on generated table handles.
+
+The `nested-namespaces` regression client exercises a real three-level C# module
+on .NET 8 and .NET 10.
+
 ### Runtime Structure
 
 Most of the core logic of the SDK lives in [`DbConnectionBase<...>`](./src/SpacetimeDBClient.cs). This handles:
@@ -64,7 +93,7 @@ Roughly speaking, code pertaining to specific tables should live in `Table.cs`, 
 
 ### Threading model
 
-The C# SDK, unlike the [Rust SDK](https://github.com/clockworklabs/SpacetimeDB/tree/master/crates/sdk), **assumes a DbConnection is only accessed from a single thread**. This thread is referred to as the "main thread". The "main thread" is:
+The C# SDK, unlike the [Rust SDK](https://github.com/clockworklabs/SpacetimeDB/tree/master/sdks/rust), **assumes a DbConnection is only accessed from a single thread**. This thread is referred to as the "main thread". The "main thread" is:
 - Whichever thread is repeatedly calling `DbConnection.FrameTick()` in a loop.
 It is **only safe to call `FrameTick()` from a single thread**. It is **only safe to access the DbConnection from this thread**. 
 (Note: we should write about this in the public docs!)
@@ -99,4 +128,3 @@ We could deduplicate multiply-subscribed rows server-side, but this represents a
 There is also a class `MultiDictionaryDelta`. This represents a pre-processed batch of changes to a `MultiDictionary`. We prepare `MultiDictionaryDelta`s on a background thread and `Apply` them on the main thread. This allows us to do at least some work without blocking the main thread.
 
 Note that if multiple subscriptions are subscribed to a row, when a server-side transaction updates that row, exactly the right number of updates will be sent over the network, in a single `ServerMessage`. `MultiDictionary` and `MultiDictionaryDelta` rely on this guarantee for correct operation, and will throw exceptions in debug mode if it is not met.
-

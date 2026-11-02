@@ -2,6 +2,13 @@ import { AlgebraicType } from '../lib/algebraic_type';
 import { FunctionVisibility, type Lifecycle } from '../lib/autogen/types';
 import type { ParamsObj, Reducer } from '../lib/reducers';
 import { type UntypedSchemaDef } from '../lib/schema';
+import { deepEqual } from '../lib/util';
+import { t } from '../lib/type_builders';
+import type {
+  OutboxMetadata,
+  ScheduleTableForParams,
+  UntypedTableSchema,
+} from '../lib/table_schema';
 import { RowBuilder, type RowObj } from '../lib/type_builders';
 import { toPascalCase } from '../lib/util';
 import {
@@ -17,16 +24,21 @@ export interface ReducerExport<
 > extends Reducer<S, Params>,
     ModuleExport {}
 
-export interface ReducerOpts {
+export interface ReducerOpts<Params extends ParamsObj = ParamsObj> {
   name: string;
+  onSchedule?: ScheduleTableForParams<Params>;
+  onResult?: UntypedTableSchema & { readonly outbox: OutboxMetadata };
 }
+
+export type ReducerOptsWithOptionalName<Params extends ParamsObj = ParamsObj> =
+  Omit<ReducerOpts<Params>, 'name'> & { name?: string };
 
 export function makeReducerExport<
   S extends UntypedSchemaDef,
   Params extends ParamsObj,
 >(
   ctx: SchemaInner,
-  opts: ReducerOpts | undefined,
+  opts: ReducerOptsWithOptionalName<Params> | undefined,
   params: RowObj | RowBuilder<RowObj>,
   fn: Reducer<any, any>,
   lifecycle?: Lifecycle
@@ -39,6 +51,18 @@ export function makeReducerExport<
       reducerExport as ReducerExport<any, any>,
       exportName
     );
+    if (opts?.onResult !== undefined) {
+      ctx.pendingOutboxCallbacks.push({
+        table: opts.onResult,
+        functionName: exportName,
+      });
+    }
+    if (opts?.onSchedule !== undefined) {
+      ctx.pendingSchedules.push({
+        table: opts.onSchedule,
+        functionName: exportName,
+      });
+    }
   };
 
   return reducerExport;
@@ -57,13 +81,36 @@ export function registerReducer(
   exportName: string,
   params: RowObj | RowBuilder<RowObj>,
   fn: Reducer<any, any>,
-  opts?: ReducerOpts,
+  opts?: ReducerOptsWithOptionalName<any>,
   lifecycle?: Lifecycle
 ): void {
   ctx.defineFunction(exportName);
 
   if (!(params instanceof RowBuilder)) {
     params = new RowBuilder(params);
+  }
+
+  if (opts?.onResult) {
+    if (opts.onSchedule) {
+      throw new TypeError('A reducer cannot use both onSchedule and onResult');
+    }
+    if (lifecycle) {
+      throw new TypeError('A lifecycle reducer cannot use onResult');
+    }
+    const target = opts.onResult;
+    const fields = Object.values(params.row);
+    if (
+      fields.length !== 2 ||
+      fields[0].typeBuilder !== target.rowType ||
+      !deepEqual(
+        fields[1].typeBuilder.algebraicType,
+        t.result(t.unit(), t.string()).algebraicType
+      )
+    ) {
+      throw new TypeError(
+        'onResult requires the outbox row followed by Result<Unit, String>'
+      );
+    }
   }
 
   if (params.typeName === undefined) {

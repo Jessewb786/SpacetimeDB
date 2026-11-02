@@ -172,6 +172,38 @@ export default defineConfig([
     esbuildOptions: commonEsbuildTweaks(),
   },
 
+  // Solid subpath (SSR-friendly): dist/solid/index.{mjs,cjs}
+  {
+    entry: { index: 'src/solid/index.ts' },
+    format: ['esm', 'cjs'],
+    target: 'es2022',
+    outDir: 'dist/solid',
+    dts: false,
+    sourcemap: true,
+    clean: true,
+    platform: 'neutral',
+    treeshake: 'smallest',
+    external: ['solid-js'],
+    outExtension,
+    esbuildOptions: commonEsbuildTweaks(),
+  },
+
+  // Solid subpath (browser ESM): dist/browser/solid/index.mjs
+  {
+    entry: { index: 'src/solid/index.ts' },
+    format: ['esm'],
+    target: 'es2022',
+    outDir: 'dist/browser/solid',
+    dts: false,
+    sourcemap: true,
+    clean: true,
+    platform: 'browser',
+    treeshake: 'smallest',
+    external: ['solid-js'],
+    outExtension,
+    esbuildOptions: commonEsbuildTweaks(),
+  },
+
   // SDK subpath (SSR-friendly): dist/sdk/index.{mjs,cjs}
   {
     entry: { index: 'src/sdk/index.ts' },
@@ -232,6 +264,26 @@ export default defineConfig([
       options.alias = { util: './src/util-stub.ts' };
       commonEsbuildTweaks()(options, ctx);
     },
+  },
+
+  // Node module unit-test helpers.
+  {
+    entry: {
+      index: 'src/server/test-utils/index.ts',
+      vitest: 'src/server/test-utils/vitest.ts',
+      wasm: 'src/server/test-utils/wasm.ts',
+    },
+    format: 'esm',
+    target: 'es2022',
+    outDir: 'dist/server/test-utils',
+    dts: true,
+    sourcemap: true,
+    clean: false,
+    platform: 'neutral',
+    external: [/^spacetime:sys.*$/],
+    treeshake: 'smallest',
+    outExtension,
+    esbuildOptions: commonEsbuildTweaks(),
   },
 
   // TanStack subpath (SSR-friendly): dist/tanstack/index.{mjs,cjs}

@@ -1,3 +1,5 @@
+import type { RemoteReducer } from './remote_module';
+import { makeOutbox } from './remote_module';
 import type { ProcedureExport, ReducerExport, t } from '../server';
 import type { errors } from '../server/errors';
 import {
@@ -20,7 +22,11 @@ import type {
   UntypedIndex,
 } from './indexes';
 import ScheduleAt from './schedule_at';
-import type { TableSchema } from './table_schema';
+import type {
+  OutboxMetadata,
+  TableSchema,
+  TableSchedule,
+} from './table_schema';
 import {
   RowBuilder,
   type ColumnBuilder,
@@ -139,6 +145,7 @@ export type UntypedTableDef = {
   constraints: readonly ConstraintOpts<any>[];
   tableDef: RawTableDefV10;
   isEvent?: boolean;
+  isOutbox?: boolean;
 };
 
 /**
@@ -194,6 +201,11 @@ export type TableOpts<Row extends RowObj> = {
   public?: boolean;
   indexes?: IndexOpts<keyof Row & string>[]; // declarative multi‑column indexes
   constraints?: ConstraintOpts<keyof Row & string>[];
+  /**
+   * @deprecated Prefer `spacetime.reducer({ onSchedule: table }, ...)` or
+   * `spacetime.procedure({ onSchedule: table }, ...)` so table definitions can
+   * live in a separate module from reducer/procedure definitions.
+   */
   scheduled?: () =>
     | ReducerExport<any, { [k: string]: RowBuilder<RowObj> }>
     | ProcedureExport<
@@ -202,25 +214,44 @@ export type TableOpts<Row extends RowObj> = {
         ReturnType<typeof t.unit>
       >;
   event?: boolean;
+  outbox?: undefined;
+};
+
+/** Options for an insert-only outbox using a generated receiver handle. */
+export type OutboxTableOpts<Row extends RowObj> = Omit<
+  TableOpts<Row>,
+  'outbox'
+> & {
+  outbox: { receiver: RemoteReducer };
 };
 
 /**
  * Extracts the indices from TableOpts, defaulting to an empty array if none are provided.
  */
-type OptsIndices<Opts extends TableOpts<any>> = Opts extends {
-  indexes: infer Ixs extends NonNullable<any[]>;
-}
-  ? Ixs
-  : CoerceArray<[]>;
+type OptsIndices<Opts extends TableOpts<any> | OutboxTableOpts<any>> =
+  Opts extends {
+    indexes: infer Ixs extends NonNullable<any[]>;
+  }
+    ? Ixs
+    : CoerceArray<[]>;
 
 /**
  * Extracts the constraints from TableOpts, defaulting to an empty array if none are provided.
  */
-type OptsConstraints<Opts extends TableOpts<any>> = Opts extends {
-  constraints: infer Constraints extends NonNullable<any[]>;
+type OptsConstraints<Opts extends TableOpts<any> | OutboxTableOpts<any>> =
+  Opts extends {
+    constraints: infer Constraints extends NonNullable<any[]>;
+  }
+    ? Constraints
+    : CoerceArray<[]>;
+
+// Ordinary TableOpts annotations must keep their existing mutable table API.
+// OutboxTableOpts requires the discriminator, even when options are widened.
+type OptsOutbox<Opts> = Opts extends {
+  outbox: object;
 }
-  ? Constraints
-  : CoerceArray<[]>;
+  ? OutboxMetadata
+  : undefined;
 
 /**
  * Table<Row, UniqueConstraintViolation = never, AutoIncOverflow = never>
@@ -231,6 +262,11 @@ type OptsConstraints<Opts extends TableOpts<any>> = Opts extends {
  */
 export type Table<TableDef extends UntypedTableDef> = Prettify<
   TableMethods<TableDef> & Indexes<TableDef, TableIndexes<TableDef>>
+>;
+
+/** Insert/read operations for outboxes, separate from the existing Table API. */
+export type OutboxTable<TableDef extends UntypedTableDef> = Prettify<
+  ReadonlyTable<TableDef> & Pick<TableMethods<TableDef>, 'insert'>
 >;
 
 export type ReadonlyTable<TableDef extends UntypedTableDef> = Prettify<
@@ -316,7 +352,10 @@ export interface TableMethods<TableDef extends UntypedTableDef>
  *
  * **How to fix:** Remove either `default()` or the constraint (`primaryKey`/`unique`/`autoInc`).
  */
-export function table<Row extends RowObj, const Opts extends TableOpts<Row>>(
+export function table<
+  Row extends RowObj,
+  const Opts extends TableOpts<Row> | OutboxTableOpts<Row>,
+>(
   opts: Opts,
   row: Row | RowBuilder<Row>,
   // ⚠️ INTERNAL: This parameter enforces compile-time validation of column metadata.
@@ -330,7 +369,7 @@ export function table<Row extends RowObj, const Opts extends TableOpts<Row>>(
         >,
       ]
     : []
-): TableSchema<CoerceRow<Row>, OptsIndices<Opts>> {
+): TableSchema<CoerceRow<Row>, OptsIndices<Opts>, OptsOutbox<Opts>> {
   const {
     name,
     public: isPublic = false,
@@ -422,11 +461,9 @@ export function table<Row extends RowObj, const Opts extends TableOpts<Row>>(
     }
 
     // If this column is shaped like ScheduleAtAlgebraicType, mark it as the schedule‑at column
-    if (scheduled) {
-      const algebraicType = builder.typeBuilder.algebraicType;
-      if (ScheduleAt.isScheduleAt(algebraicType)) {
-        scheduleAtCol = colIds.get(name)!;
-      }
+    const algebraicType = builder.typeBuilder.algebraicType;
+    if (ScheduleAt.isScheduleAt(algebraicType)) {
+      scheduleAtCol = colIds.get(name)!;
     }
   }
 
@@ -492,12 +529,18 @@ export function table<Row extends RowObj, const Opts extends TableOpts<Row>>(
     CoerceRow<Row>
   >['algebraicType']['value'];
 
-  const schedule =
+  const schedule: TableSchedule | undefined =
     scheduled && scheduleAtCol !== undefined
       ? { scheduleAtCol, reducer: scheduled }
       : undefined;
 
+  const receiver = opts.outbox?.receiver;
+  const outbox = receiver
+    ? makeOutbox(receiver, row, pk, !!scheduled || isEvent)
+    : undefined;
+
   return {
+    outbox: outbox as OptsOutbox<Opts>,
     rowType: row as RowBuilder<CoerceRow<Row>>,
     tableName: name,
     rowSpacetimeType: productType,
@@ -543,6 +586,7 @@ export function table<Row extends RowObj, const Opts extends TableOpts<Row>>(
     // can expose them without type-smuggling.
     idxs: userIndexes as OptsIndices<Opts>,
     constraints: constraints as OptsConstraints<Opts>,
+    scheduleAtCol,
     schedule,
   };
 }

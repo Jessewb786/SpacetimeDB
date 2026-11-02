@@ -5,11 +5,14 @@ use crate::table::IndexAlgo;
 use crate::{sys, AnonymousViewContext, IterBuf, ReducerContext, ReducerResult, SpacetimeType, Table, ViewContext};
 use spacetimedb_lib::bsatn::EncodeError;
 use spacetimedb_lib::db::raw_def::v10::{
-    CaseConversionPolicy, ExplicitNames as RawExplicitNames, RawModuleDefV10Builder,
+    CaseConversionPolicy, ExplicitNames as RawExplicitNames, RawEnvVarTypeV10, RawEnvironmentDeclarationV10,
+    RawModuleDefV10Builder,
 };
 pub use spacetimedb_lib::db::raw_def::v9::Lifecycle as LifecycleReducer;
 use spacetimedb_lib::db::raw_def::v9::{RawIndexAlgorithm, TableType, ViewResultHeader};
-use spacetimedb_lib::de::{self, Deserialize, DeserializeOwned, Error as _, SeqProductAccess};
+#[cfg(any(target_arch = "wasm32", feature = "unstable"))]
+use spacetimedb_lib::de::DeserializeOwned;
+use spacetimedb_lib::de::{self, Deserialize, Error as _, SeqProductAccess};
 use spacetimedb_lib::sats::typespace::TypespaceBuilder;
 use spacetimedb_lib::sats::{impl_deserialize, impl_serialize, ProductTypeElement};
 use spacetimedb_lib::ser::{Serialize, SerializeSeqProduct};
@@ -22,6 +25,7 @@ use std::sync::{Mutex, OnceLock};
 pub use sys::raw::{BytesSink, BytesSource};
 
 #[cfg(feature = "unstable")]
+use crate::http::{self, HandlerContext};
 use crate::{ProcedureContext, ProcedureResult};
 
 pub trait IntoVec<T> {
@@ -55,7 +59,6 @@ pub fn invoke_reducer<'a, A: Args<'a>>(
     reducer.invoke(ctx, args)
 }
 
-#[cfg(feature = "unstable")]
 pub fn invoke_procedure<'a, A: Args<'a>, Ret: IntoProcedureResult>(
     procedure: impl Procedure<'a, A, Ret>,
     ctx: &mut ProcedureContext,
@@ -147,11 +150,7 @@ pub trait FnInfo: ExplicitNames {
     /// The type of function to invoke.
     type Invoke;
 
-    #[cfg_attr(
-        feature = "unstable",
-        doc = "One of [`FnKindReducer`], [`FnKindProcedure`] or [`FnKindView`]."
-    )]
-    #[cfg_attr(not(feature = "unstable"), doc = "Either [`FnKindReducer`] or [`FnKindView`].")]
+    /// One of [`FnKindReducer`], [`FnKindProcedure`] or [`FnKindView`].
     ///
     /// Used as a type argument to [`ExportFunctionForScheduledTable`] and [`scheduled_typecheck`].
     /// See <https://willcrichton.net/notes/defeating-coherence-rust/> for details on this technique.
@@ -166,6 +165,14 @@ pub trait FnInfo: ExplicitNames {
     /// A description of the parameter names of the function.
     const ARG_NAMES: &'static [Option<&'static str>];
 
+    /// The source/accessor names of this view's primary key columns.
+    ///
+    /// Currently only views use this metadata.
+    const VIEW_PRIMARY_KEY_COLUMNS: &'static [&'static str] = &[];
+
+    /// The source name of the outbox table whose results this reducer handles.
+    const ON_RESULT_OUTBOX: Option<&'static str> = None;
+
     /// The function to invoke.
     const INVOKE: Self::Invoke;
 
@@ -176,7 +183,25 @@ pub trait FnInfo: ExplicitNames {
     }
 }
 
-#[cfg(feature = "unstable")]
+/// Metadata for a reducer handle generated from a remote module schema.
+///
+/// Unlike FnInfo, this does not describe a locally exported callable and
+/// therefore has no invocation function. It is used by module-side macros to
+/// typecheck calls into another database.
+pub trait RemoteReducer {
+    /// The reducer name in the remote module schema.
+    const NAME: &'static str;
+
+    /// Hash of the reducer signature as seen by the generated receiver bindings.
+    const SIGNATURE_HASH: &'static str;
+
+    /// Reducer argument product, excluding the reducer context.
+    ///
+    /// Fields preserve the remote reducer's parameter product order, matching the
+    /// signature hash and positional BSATN arguments.
+    type Args;
+}
+
 pub trait Procedure<'de, A: Args<'de>, Ret: IntoProcedureResult> {
     fn invoke(&self, ctx: &mut ProcedureContext, args: A) -> Ret;
 }
@@ -223,7 +248,6 @@ impl<E: fmt::Display> IntoReducerResult for Result<(), E> {
     }
 }
 
-#[cfg(feature = "unstable")]
 #[diagnostic::on_unimplemented(
     message = "The procedure return type `{Self}` does not implement `SpacetimeType`",
     note = "if you own the type, try adding `#[derive(SpacetimeType)]` to its definition"
@@ -234,7 +258,6 @@ pub trait IntoProcedureResult: SpacetimeType + Serialize {
         bsatn::to_vec(&self).expect("Failed to serialize procedure result")
     }
 }
-#[cfg(feature = "unstable")]
 impl<T: SpacetimeType + Serialize> IntoProcedureResult for T {}
 
 #[diagnostic::on_unimplemented(
@@ -260,7 +283,6 @@ pub trait ReducerArg {
 }
 impl<T: SpacetimeType> ReducerArg for T {}
 
-#[cfg(feature = "unstable")]
 #[diagnostic::on_unimplemented(
     message = "the first argument of a procedure must be `&mut ProcedureContext`",
     label = "first argument must be `&mut ProcedureContext`"
@@ -270,11 +292,9 @@ pub trait ProcedureContextArg {
     #[doc(hidden)]
     const _ITEM: () = ();
 }
-#[cfg(feature = "unstable")]
 impl ProcedureContextArg for &mut ProcedureContext {}
 
 /// A trait of types that can be an argument of a procedure.
-#[cfg(feature = "unstable")]
 #[diagnostic::on_unimplemented(
     message = "the procedure argument `{Self}` does not implement `SpacetimeType`",
     note = "if you own the type, try adding `#[derive(SpacetimeType)]` to its definition"
@@ -284,8 +304,37 @@ pub trait ProcedureArg {
     #[doc(hidden)]
     const _ITEM: () = ();
 }
-#[cfg(feature = "unstable")]
 impl<T: SpacetimeType> ProcedureArg for T {}
+
+#[cfg(feature = "unstable")]
+#[diagnostic::on_unimplemented(
+    message = "the first argument of an HTTP handler must be `&mut HandlerContext`",
+    label = "first argument must be `&mut HandlerContext`"
+)]
+pub trait HttpHandlerContextArg {
+    #[doc(hidden)]
+    const _ITEM: () = ();
+}
+#[cfg(feature = "unstable")]
+impl HttpHandlerContextArg for &mut HandlerContext {}
+
+#[cfg(feature = "unstable")]
+#[diagnostic::on_unimplemented(message = "the second argument of an HTTP handler must be `spacetimedb::http::Request`")]
+pub trait HttpHandlerRequestArg {
+    #[doc(hidden)]
+    const _ITEM: () = ();
+}
+#[cfg(feature = "unstable")]
+impl HttpHandlerRequestArg for crate::http::Request {}
+
+#[cfg(feature = "unstable")]
+#[diagnostic::on_unimplemented(message = "HTTP handlers must return `spacetimedb::http::Response`")]
+pub trait HttpHandlerReturn {
+    #[doc(hidden)]
+    const _ITEM: () = ();
+}
+#[cfg(feature = "unstable")]
+impl HttpHandlerReturn for crate::http::Response {}
 
 #[diagnostic::on_unimplemented(
     message = "The first parameter of a `#[view]` must be `&ViewContext` or `&AnonymousViewContext`"
@@ -423,6 +472,19 @@ impl ViewRegistrar<ViewContext> {
     {
         register_view::<A, I, T>(view)
     }
+
+    #[cfg(feature = "test-utils")]
+    #[inline]
+    #[doc(hidden)]
+    pub fn register_for_tests<'a, A, I, T, V>(view: V)
+    where
+        A: Args<'a>,
+        T: ViewReturn,
+        I: FnInfo<Invoke = ViewFn>,
+        V: View<'a, A, T>,
+    {
+        register_view_for_tests::<A, I, T>(view)
+    }
 }
 
 impl ViewRegistrar<AnonymousViewContext> {
@@ -436,6 +498,19 @@ impl ViewRegistrar<AnonymousViewContext> {
     {
         register_anonymous_view::<A, I, T>(view)
     }
+
+    #[cfg(feature = "test-utils")]
+    #[inline]
+    #[doc(hidden)]
+    pub fn register_for_tests<'a, A, I, T, V>(view: V)
+    where
+        A: Args<'a>,
+        T: ViewReturn,
+        I: FnInfo<Invoke = AnonymousFn>,
+        V: AnonymousView<'a, A, T>,
+    {
+        register_anonymous_view_for_tests::<A, I, T>(view)
+    }
 }
 
 /// Assert that a reducer type-checks with a given type.
@@ -446,12 +521,30 @@ where
     core::mem::forget(_x);
 }
 
+/// Resolve an outbox accessor to its registered table source name.
+pub const fn on_result_outbox<T, Tbl>(_table: fn(&crate::Local) -> T) -> &'static str
+where
+    T: core::ops::Deref<Target = crate::table::OutboxTable<Tbl>>,
+    Tbl: crate::Table,
+{
+    Tbl::TABLE_NAME
+}
+
+/// Assert that an `on_result` reducer accepts the outbox row and delivery result.
+pub fn on_result_typecheck<T, Tbl, F, Ret>(_f: F, _table: fn(&crate::Local) -> T)
+where
+    T: core::ops::Deref<Target = crate::table::OutboxTable<Tbl>>,
+    Tbl: crate::Table,
+    F: Fn(&ReducerContext, Tbl::Row, Result<(), String>) -> Ret,
+    Ret: IntoReducerResult,
+{
+}
+
 /// Tacit marker argument to [`ExportFunctionForScheduledTable`] for reducers.
 pub struct FnKindReducer {
     _never: Infallible,
 }
 
-#[cfg(feature = "unstable")]
 /// Tacit marker argument to [`ExportFunctionForScheduledTable`] for procedures.
 ///
 /// Holds the procedure's return type in order to avoid an error due to an unconstrained type argument.
@@ -472,14 +565,7 @@ pub struct FnKindView {
 ///
 /// The `FnKind` parameter here is a coherence-defeating marker, which Will Crichton calls a "tacit parameter."
 /// See <https://willcrichton.net/notes/defeating-coherence-rust/> for details on this technique.
-#[cfg_attr(
-    feature = "unstable",
-    doc = "It will be one of [`FnKindReducer`] or [`FnKindProcedure`] in modules that compile successfully."
-)]
-#[cfg_attr(
-    not(feature = "unstable"),
-    doc = "It will be [`FnKindReducer`] in modules that compile successfully."
-)]
+/// It will be one of [`FnKindReducer`] or [`FnKindProcedure`] in modules that compile successfully.
 ///
 /// It may be [`FnKindView`], but that will always fail to typecheck, as views cannot be used as scheduled functions.
 #[diagnostic::on_unimplemented(
@@ -495,7 +581,6 @@ impl<'de, TableRow: SpacetimeType + Serialize + Deserialize<'de>, F: Reducer<'de
 {
 }
 
-#[cfg(feature = "unstable")]
 impl<
         'de,
         TableRow: SpacetimeType + Serialize + Deserialize<'de>,
@@ -533,6 +618,9 @@ impl<T: SpacetimeType> TableColumn for T {}
 /// Assert that the primary_key column of a scheduled table is a u64.
 pub const fn assert_scheduled_table_primary_key<T: ScheduledTablePrimaryKey>() {}
 
+/// Assert that the primary_key column of an outbox table is a u64.
+pub const fn assert_outbox_table_primary_key<T: OutboxTablePrimaryKey>() {}
+
 mod sealed {
     pub trait Sealed {}
 }
@@ -543,6 +631,13 @@ mod sealed {
 pub trait ScheduledTablePrimaryKey: sealed::Sealed {}
 impl sealed::Sealed for u64 {}
 impl ScheduledTablePrimaryKey for u64 {}
+
+#[diagnostic::on_unimplemented(
+    message = "outbox table primary key must be a `u64`",
+    label = "should be `u64`, not `{Self}`"
+)]
+pub trait OutboxTablePrimaryKey: sealed::Sealed {}
+impl OutboxTablePrimaryKey for u64 {}
 
 /// Used in the last type parameter of `Reducer` to indicate that the
 /// context argument *should* be passed to the reducer logic.
@@ -631,7 +726,6 @@ macro_rules! impl_reducer_procedure_view {
             }
         }
 
-        #[cfg(feature = "unstable")]
         impl<'de, Func, Ret, $($T: SpacetimeType + Deserialize<'de> + Serialize),*> Procedure<'de, ($($T,)*), Ret> for Func
         where
             Func: Fn(&mut ProcedureContext, $($T),*) -> Ret,
@@ -763,6 +857,18 @@ pub fn register_table<T: Table>() {
 
         table.finish();
 
+        if let Some(outbox) = T::OUTBOX {
+            module.inner.add_outbox(
+                T::TABLE_NAME,
+                outbox.remote_reducer_name,
+                outbox.target_column,
+                outbox.arg_columns.iter().copied().map(Into::into),
+                None::<&str>,
+                spacetimedb_lib::Hash::from_hex(outbox.signature_hash)
+                    .expect("generated outbox signature hash must be valid hex"),
+            );
+        }
+
         module.inner.add_explicit_names(T::explicit_names());
     })
 }
@@ -790,13 +896,30 @@ pub fn register_reducer<'a, A: Args<'a>, I: FnInfo<Invoke = ReducerFn>>(_: impl 
         } else {
             module.inner.add_reducer(I::NAME, params);
         }
+        if let Some(outbox_table) = I::ON_RESULT_OUTBOX {
+            module.on_result_reducers.push((outbox_table, I::NAME));
+        }
         module.reducers.push(I::INVOKE);
 
         module.inner.add_explicit_names(I::explicit_names());
     })
 }
 
-#[cfg(feature = "unstable")]
+#[cfg(feature = "test-utils")]
+#[doc(hidden)]
+pub fn register_reducer_for_tests<'a, A: Args<'a>, I: FnInfo<Invoke = ReducerFn>>(_: impl Reducer<'a, A>) {
+    register_describer(|module| {
+        let params = A::schema::<I>(&mut module.inner);
+        if let Some(lifecycle) = I::LIFECYCLE {
+            module.inner.add_lifecycle_reducer(lifecycle, I::NAME, params);
+        } else {
+            module.inner.add_reducer(I::NAME, params);
+        }
+
+        module.inner.add_explicit_names(I::explicit_names());
+    })
+}
+
 pub fn register_procedure<'a, A, Ret, I>(_: impl Procedure<'a, A, Ret>)
 where
     A: Args<'a>,
@@ -808,6 +931,23 @@ where
         let ret_ty = <Ret as SpacetimeType>::make_type(&mut module.inner);
         module.inner.add_procedure(I::NAME, params, ret_ty);
         module.procedures.push(I::INVOKE);
+
+        module.inner.add_explicit_names(I::explicit_names());
+    })
+}
+
+#[cfg(all(feature = "test-utils", feature = "unstable"))]
+#[doc(hidden)]
+pub fn register_procedure_for_tests<'a, A, Ret, I>(_: impl Procedure<'a, A, Ret>)
+where
+    A: Args<'a>,
+    Ret: SpacetimeType + Serialize,
+    I: FnInfo<Invoke = ProcedureFn>,
+{
+    register_describer(|module| {
+        let params = A::schema::<I>(&mut module.inner);
+        let ret_ty = <Ret as SpacetimeType>::make_type(&mut module.inner);
+        module.inner.add_procedure(I::NAME, params, ret_ty);
 
         module.inner.add_explicit_names(I::explicit_names());
     })
@@ -826,9 +966,53 @@ where
         module
             .inner
             .add_view(I::NAME, module.views.len(), true, false, params, return_type);
+        if !I::VIEW_PRIMARY_KEY_COLUMNS.is_empty() {
+            module
+                .inner
+                .add_view_primary_key(I::NAME, I::VIEW_PRIMARY_KEY_COLUMNS.iter().copied());
+        }
         module.views.push(I::INVOKE);
 
         module.inner.add_explicit_names(I::explicit_names());
+    })
+}
+
+#[cfg(feature = "test-utils")]
+#[doc(hidden)]
+pub fn register_view_for_tests<'a, A, I, T>(_: impl View<'a, A, T>)
+where
+    A: Args<'a>,
+    I: FnInfo<Invoke = ViewFn>,
+    T: ViewReturn,
+{
+    register_describer(|module| {
+        let params = A::schema::<I>(&mut module.inner);
+        let return_type = I::return_type(&mut module.inner).unwrap();
+        module
+            .inner
+            .add_view(I::NAME, module.views.len(), true, false, params, return_type);
+
+        module.inner.add_explicit_names(I::explicit_names());
+    })
+}
+
+#[cfg(feature = "unstable")]
+pub fn register_http_handler(name: &'static str, handler: HttpHandlerFn) {
+    register_describer(move |module| {
+        module.inner.add_http_handler(name);
+        module.http_handlers.push(handler);
+    })
+}
+
+#[cfg(feature = "unstable")]
+pub fn register_http_router(build: fn() -> crate::http::Router) {
+    register_describer(move |module| {
+        let router = build();
+        for route in router.into_routes() {
+            module
+                .inner
+                .add_http_route(route.handler.name(), route.method, route.path);
+        }
     })
 }
 
@@ -845,7 +1029,31 @@ where
         module
             .inner
             .add_view(I::NAME, module.views_anon.len(), true, true, params, return_type);
+        if !I::VIEW_PRIMARY_KEY_COLUMNS.is_empty() {
+            module
+                .inner
+                .add_view_primary_key(I::NAME, I::VIEW_PRIMARY_KEY_COLUMNS.iter().copied());
+        }
         module.views_anon.push(I::INVOKE);
+
+        module.inner.add_explicit_names(I::explicit_names());
+    })
+}
+
+#[cfg(feature = "test-utils")]
+#[doc(hidden)]
+pub fn register_anonymous_view_for_tests<'a, A, I, T>(_: impl AnonymousView<'a, A, T>)
+where
+    A: Args<'a>,
+    I: FnInfo<Invoke = AnonymousFn>,
+    T: ViewReturn,
+{
+    register_describer(|module| {
+        let params = A::schema::<I>(&mut module.inner);
+        let return_type = I::return_type(&mut module.inner).unwrap();
+        module
+            .inner
+            .add_view(I::NAME, module.views_anon.len(), true, true, params, return_type);
 
         module.inner.add_explicit_names(I::explicit_names());
     })
@@ -874,6 +1082,88 @@ pub fn register_case_conversion_policy(policy: CaseConversionPolicy) {
     })
 }
 
+/// Implementation support for `#[env]` and `#[derive(EnvironmentValue)]`.
+///
+/// The compiler resolves aliases before selecting metadata and accessors. Custom
+/// implementations must keep their declared constraint and decoding in agreement.
+/// The host independently validates every published string against that constraint.
+#[doc(hidden)]
+#[diagnostic::on_unimplemented(
+    message = "environment fields must be `String`, an enum deriving `EnvironmentValue`, or an `Option` of either"
+)]
+pub trait EnvironmentValue: Sized {
+    const OPTIONAL: bool;
+
+    fn constraint() -> RawEnvVarTypeV10;
+
+    /// Decode a checked host result. Errors must identify only the key, never its value.
+    fn from_environment(value: Option<String>, key: &str) -> Self;
+
+    fn get(environment: &crate::Environment, key: &str) -> Self {
+        Self::from_environment(environment.get(key), key)
+    }
+}
+
+/// Required environment types supported by the optional-value implementation.
+/// Derived enums and `String` implement this; `Option<T>` deliberately does not.
+#[doc(hidden)]
+pub trait RequiredEnvironmentValue: EnvironmentValue {}
+
+impl EnvironmentValue for String {
+    const OPTIONAL: bool = false;
+
+    fn constraint() -> RawEnvVarTypeV10 {
+        RawEnvVarTypeV10::String
+    }
+
+    fn from_environment(value: Option<String>, key: &str) -> Self {
+        value.unwrap_or_else(|| panic!("required environment key is missing: {key}"))
+    }
+}
+
+impl RequiredEnvironmentValue for String {}
+
+impl<T: RequiredEnvironmentValue> EnvironmentValue for Option<T> {
+    const OPTIONAL: bool = true;
+
+    fn constraint() -> RawEnvVarTypeV10 {
+        T::constraint()
+    }
+
+    fn from_environment(value: Option<String>, key: &str) -> Self {
+        value.map(|value| T::from_environment(Some(value), key))
+    }
+}
+
+mod string_environment_value_sealed {
+    pub trait Sealed {}
+
+    impl Sealed for String {}
+    impl Sealed for Option<String> {}
+}
+
+/// Legacy field-level string constraints cannot override a typed enum's mapping.
+#[doc(hidden)]
+#[diagnostic::on_unimplemented(
+    message = "`#[env(values(...))]` requires `String` or `Option<String>`; map enum variants with `#[env(value = \"...\")]` instead"
+)]
+pub trait StringEnvironmentValue: EnvironmentValue + string_environment_value_sealed::Sealed {
+    fn with_constraint(constraint: RawEnvVarTypeV10) -> RawEnvVarTypeV10 {
+        constraint
+    }
+}
+
+impl StringEnvironmentValue for String {}
+impl StringEnvironmentValue for Option<String> {}
+
+/// Register declarative ENV metadata without reading any environment values.
+#[doc(hidden)]
+pub fn register_environment(declarations: fn() -> Vec<RawEnvironmentDeclarationV10>) {
+    register_describer(move |module| {
+        module.inner.add_environment(declarations());
+    });
+}
+
 /// A builder for a module.
 #[derive(Default)]
 pub struct ModuleBuilder {
@@ -882,12 +1172,15 @@ pub struct ModuleBuilder {
     /// The reducers of the module.
     reducers: Vec<ReducerFn>,
     /// The procedures of the module.
-    #[cfg(feature = "unstable")]
     procedures: Vec<ProcedureFn>,
+    /// The HTTP handlers of the module.
+    #[cfg(feature = "unstable")]
+    http_handlers: Vec<HttpHandlerFn>,
     /// The client specific views of the module.
     views: Vec<ViewFn>,
     /// The anonymous views of the module.
     views_anon: Vec<AnonymousFn>,
+    on_result_reducers: Vec<(&'static str, &'static str)>,
 }
 
 // Not actually a mutex; because WASM is single-threaded this basically just turns into a refcell.
@@ -898,10 +1191,13 @@ static DESCRIBERS: Mutex<Vec<Box<dyn DescriberFn>>> = Mutex::new(Vec::new());
 pub type ReducerFn = fn(&ReducerContext, &[u8]) -> ReducerResult;
 static REDUCERS: OnceLock<Vec<ReducerFn>> = OnceLock::new();
 
-#[cfg(feature = "unstable")]
 pub type ProcedureFn = fn(&mut ProcedureContext, &[u8]) -> ProcedureResult;
-#[cfg(feature = "unstable")]
 static PROCEDURES: OnceLock<Vec<ProcedureFn>> = OnceLock::new();
+
+#[cfg(feature = "unstable")]
+pub type HttpHandlerFn = fn(&mut HandlerContext, crate::http::Request) -> crate::http::Response;
+#[cfg(feature = "unstable")]
+static HTTP_HANDLERS: OnceLock<Vec<HttpHandlerFn>> = OnceLock::new();
 
 /// A view function takes in `(ViewContext, Args)` and returns a Vec of bytes.
 pub type ViewFn = fn(ViewContext, &[u8]) -> Vec<u8>;
@@ -910,6 +1206,25 @@ static VIEWS: OnceLock<Vec<ViewFn>> = OnceLock::new();
 /// An anonymous view function takes in `(AnonymousViewContext, Args)` and returns a Vec of bytes.
 pub type AnonymousFn = fn(AnonymousViewContext, &[u8]) -> Vec<u8>;
 static ANONYMOUS_VIEWS: OnceLock<Vec<AnonymousFn>> = OnceLock::new();
+
+#[cfg(feature = "test-utils")]
+#[doc(hidden)]
+pub fn module_def_for_tests() -> RawModuleDef {
+    RawModuleDef::V10(describe_module().inner.finish())
+}
+
+fn describe_module() -> ModuleBuilder {
+    let mut module = ModuleBuilder::default();
+    for describer in &mut *DESCRIBERS.lock().unwrap() {
+        describer(&mut module)
+    }
+
+    // Tables and reducers can register in either order, so link callbacks last.
+    for (outbox_table, reducer) in module.on_result_reducers.drain(..) {
+        module.inner.set_outbox_on_result(outbox_table, reducer);
+    }
+    module
+}
 
 /// Called by the host when the module is initialized
 /// to describe the module into a serialized form that is returned.
@@ -928,11 +1243,7 @@ static ANONYMOUS_VIEWS: OnceLock<Vec<AnonymousFn>> = OnceLock::new();
 /// After initialization, the module cannot alter the schema.
 #[unsafe(no_mangle)]
 extern "C" fn __describe_module__(description: BytesSink) {
-    // Collect the `module`.
-    let mut module = ModuleBuilder::default();
-    for describer in &mut *DESCRIBERS.lock().unwrap() {
-        describer(&mut module)
-    }
+    let module = describe_module();
 
     // Serialize the module to bsatn.
     let module_def = module.inner.finish();
@@ -941,8 +1252,9 @@ extern "C" fn __describe_module__(description: BytesSink) {
 
     // Write the sets of reducers, procedures and views.
     REDUCERS.set(module.reducers).ok().unwrap();
-    #[cfg(feature = "unstable")]
     PROCEDURES.set(module.procedures).ok().unwrap();
+    #[cfg(feature = "unstable")]
+    HTTP_HANDLERS.set(module.http_handlers).ok().unwrap();
     VIEWS.set(module.views).ok().unwrap();
     ANONYMOUS_VIEWS.set(module.views_anon).ok().unwrap();
 
@@ -1004,7 +1316,7 @@ extern "C" fn __call_reducer__(
 
     // Assemble the `ReducerContext`.
     let timestamp = Timestamp::from_micros_since_unix_epoch(timestamp as i64);
-    let ctx = ReducerContext::new(crate::Local {}, sender, conn_id, timestamp);
+    let ctx = ReducerContext::new(crate::Local::__host(), sender, conn_id, timestamp);
 
     // Fetch reducer function.
     let reducers = REDUCERS.get().unwrap();
@@ -1078,7 +1390,6 @@ fn convert_err_to_errno(res: Result<(), Box<str>>, out: BytesSink) -> i16 {
 /// the BSATN-serialized bytes of a value of the procedure's return type.
 ///
 /// Procedures always return the error 0. All other return values are reserved.
-#[cfg(feature = "unstable")]
 #[unsafe(no_mangle)]
 extern "C" fn __call_procedure__(
     id: usize,
@@ -1113,6 +1424,72 @@ extern "C" fn __call_procedure__(
     write_to_sink(result_sink, &res);
 
     // Return 0 for no error. Procedures always either trap or return 0.
+    0
+}
+
+/// Called by the host to execute the HTTP handler identified by `id`
+/// in response to the HTTP request `(request, request_body)`.
+///
+/// The `sender_{0-3}` are the pieces of the random `[u8; 32]` `Identity`
+/// that the host created for this request, and `sender_jwt` holds the payload of its JWT.
+///
+/// The `timestamp` will be the time as of the handler's invocation,
+/// encoded appropriately for conversion to a `spacetimedb_lib::Timestamp`,
+/// i.e. as microseconds since the Unix epoch.
+///
+/// The `request` will contain a BSATN-encoded `spacetimedb_lib::http::Request`
+/// with the metadata of the request, including URI, method, headers &c.
+///
+/// The `request_body` will contain the raw bytes of the request body.
+/// If the request included an empty HTTP body, then `request_body` will be [`BytesSource::INVALID`].
+///
+/// The HTTP handler should write a BSATN-encoded `spacetimedb_lib::http::Response` to `response_sink`
+/// containing the response metdata, including status, headers &c.
+///
+/// The HTTP handler should also write the raw bytes of its HTTP response body to the `response_body_sink`.
+///
+/// HTTP handlers always return the errno 0. All other return values are reserved.
+#[cfg(feature = "unstable")]
+#[unsafe(no_mangle)]
+extern "C" fn __call_http_handler__(
+    id: usize,
+    sender_0: u64,
+    sender_1: u64,
+    sender_2: u64,
+    sender_3: u64,
+    sender_jwt: BytesSource,
+    timestamp: u64,
+    request: BytesSource,
+    request_body: BytesSource,
+    response_sink: BytesSink,
+    response_body_sink: BytesSink,
+) -> i16 {
+    let sender = reconstruct_sender_identity(sender_0, sender_1, sender_2, sender_3);
+    // Read the JWT now, since the host reuses the ids of bytes sources in later calls.
+    let sender_jwt = read_jwt(sender_jwt);
+    let sender_auth = crate::AuthCtx::for_sender(sender, move || sender_jwt);
+    let timestamp = Timestamp::from_micros_since_unix_epoch(timestamp as i64);
+    let mut ctx = HandlerContext::new(sender, sender_auth, timestamp);
+
+    let handlers = HTTP_HANDLERS.get().unwrap();
+    let request = read_bytes_source_as::<spacetimedb_lib::http::Request>(request);
+    // TODO(streaming-http): stop reading the full request body into guest memory once handlers
+    // can consume the body incrementally from the host-provided byte source.
+    let request_body = if request_body == BytesSource::INVALID {
+        bytes::Bytes::new()
+    } else {
+        let mut buf = IterBuf::take();
+        read_bytes_source_into(request_body, &mut buf);
+        buf.clone().into()
+    };
+    let request = http::request_from_wire(request, request_body);
+
+    let response = handlers[id](&mut ctx, request);
+    let (response_meta, response_body_bytes) = http::response_into_wire(response);
+    let bytes = bsatn::to_vec(&response_meta).expect("failed to serialize http response");
+    write_to_sink(response_sink, &bytes);
+    write_to_sink(response_body_sink, &response_body_bytes);
+
     0
 }
 
@@ -1208,13 +1585,24 @@ const NO_SUCH_BYTES: u16 = errno::NO_SUCH_BYTES.get();
 
 /// Look up the jwt associated with `connection_id`.
 pub fn get_jwt(connection_id: ConnectionId) -> Option<String> {
+    read_jwt(sys::get_jwt(connection_id.as_le_byte_array())?)
+}
+
+/// Read the jwt that the host wrote to `source`.
+pub(crate) fn read_jwt(source: BytesSource) -> Option<String> {
     let mut buf = IterBuf::take();
-    let source = sys::get_jwt(connection_id.as_le_byte_array())?;
     if source == BytesSource::INVALID {
         return None;
     }
     read_bytes_source_into(source, &mut buf);
     Some(std::str::from_utf8(&buf).unwrap().to_string())
+}
+
+pub(crate) fn env_get(key: &str) -> Option<String> {
+    let source = sys::env_get(key)?;
+    let mut buf = IterBuf::take();
+    read_bytes_source_into(source, &mut buf);
+    Some(String::from_utf8(buf.to_vec()).expect("host environment values are UTF-8"))
 }
 
 /// Read `source` from the host fully into `buf`.
@@ -1299,6 +1687,37 @@ macro_rules! __make_register_reftype {
             extern "C" fn __register_describer() {
                 $crate::rt::register_reftype::<$ty>()
             }
+
+            #[cfg(all(feature = "test-utils", not(target_arch = "wasm32")))]
+            #[used]
+            #[cfg_attr(
+                any(
+                    target_os = "linux",
+                    target_os = "android",
+                    target_os = "freebsd",
+                    target_os = "dragonfly",
+                    target_os = "netbsd",
+                    target_os = "openbsd",
+                ),
+                unsafe(link_section = ".init_array")
+            )]
+            #[cfg_attr(
+                any(
+                    target_os = "macos",
+                    target_os = "ios",
+                    target_os = "tvos",
+                    target_os = "watchos",
+                    target_os = "visionos",
+                ),
+                unsafe(link_section = "__DATA,__mod_init_func")
+            )]
+            #[cfg_attr(target_os = "windows", unsafe(link_section = ".CRT$XCU"))]
+            static _STDB_TEST_UTILS_INIT: unsafe extern "C" fn() = {
+                unsafe extern "C" fn __stdb_test_utils_register() {
+                    $crate::rt::register_reftype::<$ty>()
+                }
+                __stdb_test_utils_register
+            };
         };
     };
 }
@@ -1319,7 +1738,7 @@ pub fn volatile_nonatomic_schedule_immediate<'de, A: Args<'de>, R: Reducer<'de, 
 ///
 /// Panics if the bytes from `source` fail to deserialize as `T`.
 /// The type name of `T` will be included in the panic message.
-#[cfg_attr(not(feature = "unstable"), allow(unused))]
+#[cfg(any(target_arch = "wasm32", feature = "unstable"))]
 pub(crate) fn read_bytes_source_as<T: DeserializeOwned + 'static>(source: BytesSource) -> T {
     let mut buf = IterBuf::take();
     read_bytes_source_into(source, &mut buf);

@@ -1,3 +1,4 @@
+import { environment, type EnvironmentFor } from './environment';
 import * as _syscalls2_0 from 'spacetime:sys@2.0';
 import * as _syscalls2_1 from 'spacetime:sys@2.1';
 
@@ -10,6 +11,8 @@ import {
 import {
   RawModuleDef,
   ViewResultHeader,
+  type RawProcedureDefV10,
+  type RawReducerDefV10,
   type RawTableDefV10,
   type Typespace,
 } from '../lib/autogen/types';
@@ -27,26 +30,87 @@ import {
   type UniqueIndex,
 } from '../lib/indexes';
 import { callProcedure } from './procedures';
+import type { Procedures } from './procedures';
+import type { Reducers } from './reducers';
 import {
+  type HandlerContext,
+  Request,
+  SyncResponse,
+  makeRequest,
+} from './http_handlers';
+import { httpClient, type HttpClient } from './http_internal';
+import {
+  deserializeHeaders,
+  deserializeMethod,
+  serializeHeaders,
+} from './http_shared';
+import {
+  type AliasViews,
   type AuthCtx,
   type JsonObject,
   type JwtClaims,
   type ReducerCtx as IReducerCtx,
 } from '../lib/reducers';
 import { type UntypedSchemaDef } from '../lib/schema';
-import { type RowType, type Table, type TableMethods } from '../lib/table';
-import { hasOwn } from '../lib/util';
-import { type AnonymousViewCtx, type ViewCtx } from './views';
-import { isRowTypedQuery, makeQueryBuilder, toSql } from './query';
-import type { DbView } from './db_view';
+import {
+  type RowType,
+  type Table,
+  type TableMethods,
+  type UntypedTableDef,
+} from '../lib/table';
+import { bsatnBaseSize, hasOwn } from '../lib/util';
+import {
+  type AnonymousViewCtx,
+  type AnonViews,
+  type ViewCtx,
+  type Views,
+} from './views';
+import {
+  isRowTypedQuery,
+  makeQueryBuilder,
+  toSql,
+  type QueryBuilder,
+} from './query';
+import type { DbView, ReadonlyDbView } from './db_view';
 import { getErrorConstructor, SenderError } from './errors';
 import { Range, type Bound } from './range';
 import { makeRandom, type Random } from './rng';
-import type { SchemaInner } from './schema';
+import type { SubmoduleDispatchInfo, SchemaInner } from './schema';
+import { hostBackend, type DatastoreBackend } from './backend';
+import { HttpRequest, HttpResponse } from '../lib/autogen/types';
 
 const { freeze } = Object;
 
 export const sys = { ..._syscalls2_0, ..._syscalls2_1 };
+
+function isDatastoreBackend(value: unknown): value is DatastoreBackend {
+  return (
+    value !== null &&
+    typeof value === 'object' &&
+    'tableIdFromName' in value &&
+    'procedureStartMutTx' in value
+  );
+}
+
+function requestFromWire(request: HttpRequest, body: Uint8Array): Request {
+  return Request[makeRequest](body, {
+    headers: deserializeHeaders(request.headers),
+    method: deserializeMethod(request.method),
+    uri: request.uri,
+    version: request.version,
+  });
+}
+
+function responseIntoWire(response: SyncResponse): [HttpResponse, Uint8Array] {
+  return [
+    {
+      headers: serializeHeaders(response.headers),
+      version: response.version,
+      code: response.status,
+    },
+    response.bytes(),
+  ];
+}
 
 export function parseJsonObject(json: string): JsonObject {
   let value: unknown;
@@ -123,7 +187,7 @@ class AuthCtxImpl implements AuthCtx {
     if (this._initializedJWT) return;
     this._initializedJWT = true;
 
-    const token = this._jwtSource();
+    const token = this.isInternal ? null : this._jwtSource();
     if (!token) {
       this._jwtClaims = null;
     } else {
@@ -154,28 +218,53 @@ class AuthCtxImpl implements AuthCtx {
     });
   }
 
-  /** If there is a connection id, look up the JWT payload from the system tables. */
-  static fromSystemTables(
-    connectionId: ConnectionId | null,
-    sender: Identity
+  /**
+   * Create the context of an invocation by `sender`,
+   * which is internal when `sender` is this database,
+   * and otherwise reads the JWT payload from `jwtPayload` on first use.
+   */
+  static forSender(
+    sender: Identity,
+    databaseIdentity: Identity,
+    jwtPayload: () => Uint8Array | null
   ): AuthCtx {
-    if (connectionId === null) {
-      return new AuthCtxImpl({
-        isInternal: false,
-        jwtSource: () => null,
-        senderIdentity: sender,
-      });
-    }
     return new AuthCtxImpl({
-      isInternal: false,
+      isInternal: sender.isEqual(databaseIdentity),
       jwtSource: () => {
-        const payloadBuf = sys.get_jwt_payload(connectionId.__connection_id__);
-        if (payloadBuf.length === 0) return null;
+        const payloadBuf = jwtPayload();
+        if (payloadBuf === null || payloadBuf.length === 0) return null;
         const payloadStr = new TextDecoder().decode(payloadBuf);
         return payloadStr;
       },
       senderIdentity: sender,
     });
+  }
+
+  /** If there is a connection id, look up the JWT payload from the system tables. */
+  static fromBackend(
+    connectionId: ConnectionId | null,
+    sender: Identity,
+    databaseIdentity: Identity,
+    backend: DatastoreBackend
+  ): AuthCtx {
+    return AuthCtxImpl.forSender(sender, databaseIdentity, () =>
+      connectionId === null
+        ? null
+        : backend.getJwtPayload(connectionId.__connection_id__)
+    );
+  }
+
+  /** If there is a connection id, look up the JWT payload from the host system tables. */
+  static fromSystemTables(
+    connectionId: ConnectionId | null,
+    sender: Identity
+  ): AuthCtx {
+    return AuthCtxImpl.fromBackend(
+      connectionId,
+      sender,
+      new Identity(hostBackend.identity()),
+      hostBackend
+    );
   }
 }
 
@@ -189,40 +278,101 @@ export const ReducerCtxImpl = class ReducerCtx<
   #senderAuth: AuthCtx | undefined;
   #uuidCounter: { value: number } | undefined;
   #random: Random | undefined;
+  #backend: DatastoreBackend;
   sender: Identity;
   timestamp: Timestamp;
   connectionId: ConnectionId | null;
   db: DbView<SchemaDef>;
+  readonly env = environment as EnvironmentFor<SchemaDef>;
+  as: AliasViews<SchemaDef>;
 
   constructor(
     sender: Identity,
     timestamp: Timestamp,
     connectionId: ConnectionId | null,
-    dbView: DbView<any>
+    dbView: DbView<any>,
+    backendOrAsViews: DatastoreBackend | object = hostBackend,
+    senderAuth?: AuthCtx,
+    random?: Random,
+    asViews: object = {}
   ) {
     Object.seal(this);
     this.sender = sender;
     this.timestamp = timestamp;
     this.connectionId = connectionId;
-    this.db = dbView;
+    this.db = dbView as unknown as DbView<SchemaDef>;
+    if (isDatastoreBackend(backendOrAsViews)) {
+      this.#backend = backendOrAsViews;
+      this.#senderAuth = senderAuth;
+      this.#random = random;
+    } else {
+      this.#backend = hostBackend;
+      asViews = backendOrAsViews;
+    }
+    this.as = asViews as AliasViews<SchemaDef>;
   }
 
   /** Reset the `ReducerCtx` to be used for a new transaction */
-  static reset(
+  static resetHost(
     me: InstanceType<typeof this>,
     sender: Identity,
     timestamp: Timestamp,
-    connectionId: ConnectionId | null
+    connectionId: ConnectionId | null,
+    dbView?: DbView<any>,
+    asViews?: object
   ) {
     me.sender = sender;
     me.timestamp = timestamp;
     me.connectionId = connectionId;
-    me.#uuidCounter = undefined;
+    me.#backend = hostBackend;
     me.#senderAuth = undefined;
+    me.#random = undefined;
+    me.#uuidCounter = undefined;
+    if (dbView !== undefined) {
+      me.db = dbView;
+    }
+    if (asViews !== undefined) {
+      me.as = asViews as AliasViews<any>;
+    }
+  }
+
+  /** Reset the `ReducerCtx` to be used with an injectable backend. */
+  static reset(
+    me: InstanceType<typeof this>,
+    sender: Identity,
+    timestamp: Timestamp,
+    connectionId: ConnectionId | null,
+    backendOrDbView: DatastoreBackend | DbView<any> = hostBackend,
+    senderAuth?: AuthCtx | object,
+    random?: Random,
+    dbView?: DbView<any>,
+    asViews?: object
+  ) {
+    me.sender = sender;
+    me.timestamp = timestamp;
+    me.connectionId = connectionId;
+    if (isDatastoreBackend(backendOrDbView)) {
+      me.#backend = backendOrDbView;
+      me.#senderAuth = senderAuth as AuthCtx | undefined;
+      me.#random = random;
+    } else {
+      me.#backend = hostBackend;
+      me.#senderAuth = undefined;
+      me.#random = undefined;
+      dbView = backendOrDbView;
+      asViews = senderAuth as object | undefined;
+    }
+    me.#uuidCounter = undefined;
+    if (dbView !== undefined) {
+      me.db = dbView;
+    }
+    if (asViews !== undefined) {
+      me.as = asViews as AliasViews<any>;
+    }
   }
 
   get databaseIdentity() {
-    return (this.#identity ??= new Identity(sys.identity()));
+    return (this.#identity ??= new Identity(this.#backend.identity()));
   }
 
   get identity() {
@@ -230,9 +380,11 @@ export const ReducerCtxImpl = class ReducerCtx<
   }
 
   get senderAuth() {
-    return (this.#senderAuth ??= AuthCtxImpl.fromSystemTables(
+    return (this.#senderAuth ??= AuthCtxImpl.fromBackend(
       this.connectionId,
-      this.sender
+      this.sender,
+      this.databaseIdentity,
+      this.#backend
     ));
   }
 
@@ -272,32 +424,188 @@ export const callUserFunction = function __spacetimedb_end_short_backtrace<
   return fn(...args);
 };
 
+export function runWithTx<T, Ctx>(
+  makeCtx: (timestamp: Timestamp) => Ctx,
+  body: (ctx: Ctx) => T,
+  backend: DatastoreBackend = hostBackend
+): T {
+  const run = () => {
+    const timestamp = backend.procedureStartMutTx();
+
+    try {
+      return body(makeCtx(new Timestamp(timestamp)));
+    } catch (e) {
+      backend.procedureAbortMutTx();
+      throw e;
+    }
+  };
+
+  let res = run();
+  try {
+    backend.procedureCommitMutTx();
+    return res;
+  } catch {
+    // ignore the commit error
+  }
+  console.warn('committing anonymous transaction failed');
+  res = run();
+  try {
+    backend.procedureCommitMutTx();
+    return res;
+  } catch (e) {
+    throw new Error('transaction retry failed again', { cause: e });
+  }
+}
+
+type FlatSubmoduleDispatch = {
+  reducerFns: Reducers;
+  reducerDefs: RawReducerDefV10[];
+  procedureFns: Procedures;
+  procedureDefs: RawProcedureDefV10[];
+  anonViewFns: AnonViews;
+  viewFns: Views;
+  tables: Array<{ accessorName: string; tableDef: RawTableDefV10 }>;
+  schemaTables: Record<string, UntypedTableDef>;
+  typespace: Typespace;
+  dbView_: DbView<any> | undefined;
+  queryBuilder_: QueryBuilder<any> | undefined;
+  /** e.g. "alias." for a submodule with namespace alias "alias" */
+  namePrefix: string;
+  subDispatches: SubmoduleDispatchInfo[];
+};
+
+function flattenSubmoduleDispatches(
+  dispatches: SubmoduleDispatchInfo[],
+  parentPrefix = ''
+): FlatSubmoduleDispatch[] {
+  const result: FlatSubmoduleDispatch[] = [];
+  for (const d of dispatches) {
+    const namePrefix = parentPrefix + d.namespace + '.';
+    result.push({
+      reducerFns: d.reducerFns,
+      reducerDefs: d.reducerDefs,
+      procedureFns: d.procedureFns,
+      procedureDefs: d.procedureDefs,
+      anonViewFns: d.anonViewFns,
+      viewFns: d.viewFns,
+      tables: d.tables,
+      schemaTables: d.schemaTables,
+      typespace: d.typespace,
+      dbView_: undefined,
+      queryBuilder_: undefined,
+      namePrefix,
+      subDispatches: d.subDispatches,
+    });
+    result.push(...flattenSubmoduleDispatches(d.subDispatches, namePrefix));
+  }
+  return result;
+}
+
 export const makeHooks = (schema: SchemaInner): ModuleHooks =>
   new ModuleHooksImpl(schema);
 
 class ModuleHooksImpl implements ModuleHooks {
   #schema: SchemaInner;
   #dbView_: DbView<any> | undefined;
+  #consumerAs_: object | undefined;
   #reducerArgsDeserializers;
-  /** Cache the `ReducerCtx` object to avoid allocating anew for ever reducer call. */
+  #consumerReducerCount: number;
+  #consumerProcedureCount: number;
+  #flatSubmodules: FlatSubmoduleDispatch[];
+  #consumerAnonViewCount: number;
+  #consumerViewCount: number;
+  /** Cache the `ReducerCtx` object to avoid allocating anew for every reducer call. */
   #reducerCtx_: InstanceType<typeof ReducerCtxImpl> | undefined;
+  /** Per-submodule alias ctx maps, cached lazily (parallel to #flatSubmodules). */
+  #submoduleAsViews_: (object | undefined)[] = [];
 
   constructor(schema: SchemaInner) {
     this.#schema = schema;
-    this.#reducerArgsDeserializers = schema.moduleDef.reducers.map(
-      ({ params }) => ProductType.makeDeserializer(params, schema.typespace)
+    this.#consumerReducerCount = schema.reducers.length;
+    this.#consumerProcedureCount = schema.procedures.length;
+    this.#consumerAnonViewCount = schema.anonViews.length;
+    this.#consumerViewCount = schema.views.length;
+    this.#flatSubmodules = flattenSubmoduleDispatches(
+      schema.submoduleDispatchInfos
     );
+
+    const consumerDeserializers = schema.moduleDef.reducers.map(({ params }) =>
+      ProductType.makeDeserializer(params, schema.typespace)
+    );
+    const submoduleDeserializers = this.#flatSubmodules.flatMap(
+      ({ reducerDefs, typespace }) =>
+        reducerDefs.map(({ params }) =>
+          ProductType.makeDeserializer(params, typespace)
+        )
+    );
+    this.#reducerArgsDeserializers = [
+      ...consumerDeserializers,
+      ...submoduleDeserializers,
+    ];
   }
 
   get #dbView() {
-    return (this.#dbView_ ??= freeze(
+    if (this.#dbView_ !== undefined) return this.#dbView_;
+    const rootTables = Object.values(this.#schema.schemaType.tables).map(
+      table => [
+        table.accessorName,
+        makeTableView(
+          this.#schema.typespace,
+          table.tableDef,
+          hostBackend,
+          '',
+          table.isOutbox
+        ),
+      ]
+    );
+    const submoduleNs = this.#schema.submoduleDispatchInfos.map(dispatch => [
+      dispatch.namespace,
+      buildDbViewForDispatch(dispatch, dispatch.namespace + '.'),
+    ]);
+    this.#dbView_ = freeze(
+      Object.fromEntries([...rootTables, ...submoduleNs])
+    ) as DbView<any>;
+    return this.#dbView_;
+  }
+
+  #getSubmoduleDbView(submoduleIdx: number): DbView<any> {
+    const m = this.#flatSubmodules[submoduleIdx];
+    return (m.dbView_ ??= freeze(
       Object.fromEntries(
-        Object.values(this.#schema.schemaType.tables).map(table => [
-          table.accessorName,
-          makeTableView(this.#schema.typespace, table.tableDef),
+        m.tables.map(({ accessorName, tableDef }) => [
+          accessorName,
+          makeTableView(
+            m.typespace,
+            tableDef,
+            hostBackend,
+            m.namePrefix,
+            m.schemaTables[accessorName].isOutbox
+          ),
         ])
-      )
+      ) as DbView<any>
     ));
+  }
+
+  #getSubmoduleAsViews(submoduleIdx: number): object {
+    return (this.#submoduleAsViews_[submoduleIdx] ??= buildAliasCtxMap(
+      this.#reducerCtx,
+      this.#flatSubmodules[submoduleIdx].subDispatches,
+      this.#flatSubmodules[submoduleIdx].namePrefix
+    ));
+  }
+
+  /** Query builder scoped to the submodule's own tables, with namespace-prefixed
+   *  source names so generated SQL targets the mounted table names. */
+  #getSubmoduleQueryBuilder(submoduleIdx: number): QueryBuilder<any> {
+    const m = this.#flatSubmodules[submoduleIdx];
+    return (m.queryBuilder_ ??= makeQueryBuilder({
+      tables: Object.fromEntries(
+        Object.entries(m.schemaTables).map(([key, def]) => [
+          key,
+          { ...def, sourceName: m.namePrefix + def.sourceName },
+        ])
+      ),
+    }));
   }
 
   get #reducerCtx() {
@@ -306,6 +614,14 @@ class ModuleHooksImpl implements ModuleHooks {
       Timestamp.UNIX_EPOCH,
       null,
       this.#dbView
+    ));
+  }
+
+  get #consumerAs() {
+    return (this.#consumerAs_ ??= buildAliasCtxMap(
+      this.#reducerCtx,
+      this.#schema.submoduleDispatchInfos,
+      ''
     ));
   }
 
@@ -333,19 +649,46 @@ class ModuleHooksImpl implements ModuleHooks {
     timestamp: bigint,
     argsBuf: DataView
   ): void {
-    const moduleCtx = this.#schema;
     const deserializeArgs = this.#reducerArgsDeserializers[reducerId];
     BINARY_READER.reset(argsBuf);
     const args = deserializeArgs(BINARY_READER);
     const senderIdentity = new Identity(sender);
+
+    let fn: ((...args: any[]) => any) | undefined;
+    let dbView: DbView<any>;
+    let asViews: object;
+
+    if (reducerId < this.#consumerReducerCount) {
+      fn = this.#schema.reducers[reducerId];
+      dbView = this.#dbView;
+      asViews = this.#consumerAs;
+    } else {
+      let offset = this.#consumerReducerCount;
+      for (let i = 0; i < this.#flatSubmodules.length; i++) {
+        const m = this.#flatSubmodules[i];
+        if (reducerId < offset + m.reducerFns.length) {
+          fn = m.reducerFns[reducerId - offset];
+          dbView = this.#getSubmoduleDbView(i);
+          asViews = this.#getSubmoduleAsViews(i);
+          break;
+        }
+        offset += m.reducerFns.length;
+      }
+      if (fn === undefined) {
+        throw new RangeError(`unknown reducerId ${reducerId}`);
+      }
+    }
+
     const ctx = this.#reducerCtx;
-    ReducerCtxImpl.reset(
+    ReducerCtxImpl.resetHost(
       ctx,
       senderIdentity,
       new Timestamp(timestamp),
-      ConnectionId.nullIfZero(new ConnectionId(connId))
+      ConnectionId.nullIfZero(new ConnectionId(connId)),
+      dbView!,
+      asViews!
     );
-    callUserFunction(moduleCtx.reducers[reducerId], ctx, args);
+    callUserFunction(fn, ctx, args);
   }
 
   __call_view__(
@@ -354,15 +697,41 @@ class ModuleHooksImpl implements ModuleHooks {
     argsBuf: Uint8Array
   ): { data: Uint8Array } {
     const moduleCtx = this.#schema;
+    let viewFns: Views;
+    let localId: number;
+    let dbView: ReadonlyDbView<any>;
+    let from: QueryBuilder<any>;
+
+    if (id < this.#consumerViewCount) {
+      viewFns = moduleCtx.views;
+      localId = id;
+      dbView = this.#dbView as ReadonlyDbView<any>;
+      from = makeQueryBuilder(moduleCtx.schemaType);
+    } else {
+      let offset = this.#consumerViewCount;
+      let found = false;
+      for (let i = 0; i < this.#flatSubmodules.length; i++) {
+        const m = this.#flatSubmodules[i];
+        if (id < offset + m.viewFns.length) {
+          viewFns = m.viewFns;
+          localId = id - offset;
+          dbView = this.#getSubmoduleDbView(i) as ReadonlyDbView<any>;
+          from = this.#getSubmoduleQueryBuilder(i);
+          found = true;
+          break;
+        }
+        offset += m.viewFns.length;
+      }
+      if (!found) throw new RangeError(`unknown viewId ${id}`);
+    }
+
     const { fn, deserializeParams, serializeReturn, returnTypeBaseSize } =
-      moduleCtx.views[id];
+      viewFns![localId!];
     const ctx: ViewCtx<any> = freeze({
+      env: environment,
       sender: new Identity(sender),
-      // this is the non-readonly DbView, but the typing for the user will be
-      // the readonly one, and if they do call mutating functions it will fail
-      // at runtime
-      db: this.#dbView,
-      from: makeQueryBuilder(moduleCtx.schemaType),
+      db: dbView!,
+      from: from!,
     });
     const args = deserializeParams(new BinaryReader(argsBuf));
     const ret = callUserFunction(fn, ctx, args);
@@ -379,14 +748,40 @@ class ModuleHooksImpl implements ModuleHooks {
 
   __call_view_anon__(id: u32, argsBuf: Uint8Array): { data: Uint8Array } {
     const moduleCtx = this.#schema;
+    let anonViewFns: AnonViews;
+    let localId: number;
+    let dbView: ReadonlyDbView<any>;
+    let from: QueryBuilder<any>;
+
+    if (id < this.#consumerAnonViewCount) {
+      anonViewFns = moduleCtx.anonViews;
+      localId = id;
+      dbView = this.#dbView as ReadonlyDbView<any>;
+      from = makeQueryBuilder(moduleCtx.schemaType);
+    } else {
+      let offset = this.#consumerAnonViewCount;
+      let found = false;
+      for (let i = 0; i < this.#flatSubmodules.length; i++) {
+        const m = this.#flatSubmodules[i];
+        if (id < offset + m.anonViewFns.length) {
+          anonViewFns = m.anonViewFns;
+          localId = id - offset;
+          dbView = this.#getSubmoduleDbView(i) as ReadonlyDbView<any>;
+          from = this.#getSubmoduleQueryBuilder(i);
+          found = true;
+          break;
+        }
+        offset += m.anonViewFns.length;
+      }
+      if (!found) throw new RangeError(`unknown anonViewId ${id}`);
+    }
+
     const { fn, deserializeParams, serializeReturn, returnTypeBaseSize } =
-      moduleCtx.anonViews[id];
+      anonViewFns![localId!];
     const ctx: AnonymousViewCtx<any> = freeze({
-      // this is the non-readonly DbView, but the typing for the user will be
-      // the readonly one, and if they do call mutating functions it will fail
-      // at runtime
-      db: this.#dbView,
-      from: makeQueryBuilder(moduleCtx.schemaType),
+      env: environment,
+      db: dbView!,
+      from: from!,
     });
     const args = deserializeParams(new BinaryReader(argsBuf));
     const ret = callUserFunction(fn, ctx, args);
@@ -408,26 +803,429 @@ class ModuleHooksImpl implements ModuleHooks {
     timestamp: bigint,
     args: Uint8Array
   ): Uint8Array {
-    return callProcedure(
-      this.#schema,
-      id,
+    const senderIdentity = new Identity(sender);
+    const connId = ConnectionId.nullIfZero(new ConnectionId(connection_id));
+    const ts = new Timestamp(timestamp);
+
+    if (id < this.#consumerProcedureCount) {
+      return callProcedure(
+        this.#schema.procedures,
+        id,
+        senderIdentity,
+        connId,
+        ts,
+        args,
+        () => this.#dbView as DbView<any>,
+        this.#schema.submoduleDispatchInfos
+      );
+    }
+
+    let offset = this.#consumerProcedureCount;
+    for (let i = 0; i < this.#flatSubmodules.length; i++) {
+      const m = this.#flatSubmodules[i];
+      if (id < offset + m.procedureFns.length) {
+        return callProcedure(
+          m.procedureFns,
+          id - offset,
+          senderIdentity,
+          connId,
+          ts,
+          args,
+          () => this.#getSubmoduleDbView(i),
+          m.subDispatches,
+          m.namePrefix
+        );
+      }
+      offset += m.procedureFns.length;
+    }
+
+    throw new RangeError(`unknown procedureId ${id}`);
+  }
+
+  __call_http_handler__(
+    id: u32,
+    timestamp: bigint,
+    request: Uint8Array,
+    body: Uint8Array,
+    sender: u256,
+    senderJwt: Uint8Array
+  ): [response: Uint8Array, body: Uint8Array] {
+    const moduleCtx = this.#schema;
+    const handler = moduleCtx.httpHandlers[id];
+    const ctx = new HandlerContextImpl(
       new Identity(sender),
-      ConnectionId.nullIfZero(new ConnectionId(connection_id)),
       new Timestamp(timestamp),
-      args,
-      () => this.#dbView
+      senderJwt,
+      () => this.#dbView,
+      this.#schema.submoduleDispatchInfos
     );
+    const requestMetadata = HttpRequest.deserialize(new BinaryReader(request));
+    const response = callUserFunction(
+      handler,
+      ctx,
+      requestFromWire(requestMetadata, body)
+    );
+    const [responseMetadata, responseBody] = responseIntoWire(response);
+    const responseBuf = new BinaryWriter(
+      bsatnBaseSize(moduleCtx.typespace, HttpResponse.algebraicType)
+    );
+    HttpResponse.serialize(responseBuf, responseMetadata);
+    return [responseBuf.getBuffer(), responseBody];
   }
 }
 
 const BINARY_WRITER = new BinaryWriter(0);
 const BINARY_READER = new BinaryReader(new Uint8Array());
 
-function makeTableView(
+class HandlerContextImpl<S extends UntypedSchemaDef = UntypedSchemaDef>
+  implements HandlerContext<S>
+{
+  readonly env = environment as EnvironmentFor<S>;
+  #identity: Identity | undefined;
+  #senderJwt: Uint8Array;
+  #senderAuth: AuthCtx | undefined;
+  #uuidCounter: { value: number } | undefined;
+  #random: Random | undefined;
+  #dbView: () => DbView<any>;
+  #dispatches: SubmoduleDispatchInfo[];
+  #asViews: object | undefined;
+
+  readonly http = httpClient;
+
+  constructor(
+    readonly sender: Identity,
+    readonly timestamp: Timestamp,
+    senderJwt: Uint8Array,
+    dbView: () => DbView<any>,
+    dispatches: SubmoduleDispatchInfo[] = []
+  ) {
+    this.#senderJwt = senderJwt;
+    this.#dbView = dbView;
+    this.#dispatches = dispatches;
+  }
+
+  /** The `AuthCtx` of `me.sender`, which the transactions that `me` opens share. */
+  static senderAuth(me: HandlerContextImpl): AuthCtx {
+    return (me.#senderAuth ??= AuthCtxImpl.forSender(
+      me.sender,
+      me.identity,
+      () => me.#senderJwt
+    ));
+  }
+
+  get identity() {
+    return (this.#identity ??= new Identity(sys.identity()));
+  }
+
+  get random() {
+    return (this.#random ??= makeRandom(this.timestamp));
+  }
+
+  get as() {
+    return (this.#asViews ??= buildHandlerAliasCtxMap(
+      this,
+      this.#dispatches,
+      ''
+    )) as any;
+  }
+
+  withTx<T>(body: (ctx: any) => T): T {
+    const dispatches = this.#dispatches;
+    return runWithTx(timestamp => {
+      const tx = new ReducerCtxImpl(
+        this.sender,
+        timestamp,
+        null,
+        this.#dbView(),
+        hostBackend,
+        HandlerContextImpl.senderAuth(this)
+      );
+      if (dispatches.length > 0) {
+        tx.as = buildAliasCtxMap(tx, dispatches, '') as any;
+      }
+      return tx;
+    }, body);
+  }
+
+  newUuidV4(): Uuid {
+    const bytes = this.random.fill(new Uint8Array(16));
+    return Uuid.fromRandomBytesV4(bytes);
+  }
+
+  newUuidV7(): Uuid {
+    const bytes = this.random.fill(new Uint8Array(4));
+    const counter = (this.#uuidCounter ??= { value: 0 });
+    return Uuid.fromCounterV7(counter, this.timestamp, bytes);
+  }
+}
+
+function buildDbViewForDispatch(
+  dispatch: SubmoduleDispatchInfo,
+  namePrefix: string
+): object {
+  const tableEntries = dispatch.tables.map(({ accessorName, tableDef }) => [
+    accessorName,
+    makeTableView(
+      dispatch.typespace,
+      tableDef,
+      hostBackend,
+      namePrefix,
+      dispatch.schemaTables[accessorName].isOutbox
+    ),
+  ]);
+  const subNsEntries = dispatch.subDispatches.map(sub => [
+    sub.namespace,
+    buildDbViewForDispatch(sub, namePrefix + sub.namespace + '.'),
+  ]);
+  return freeze(Object.fromEntries([...tableEntries, ...subNsEntries]));
+}
+
+function buildAliasCtx(
+  parent: InstanceType<typeof ReducerCtxImpl>,
+  dispatch: SubmoduleDispatchInfo,
+  namePrefix: string
+): object {
+  const nsDb = buildDbViewForDispatch(dispatch, namePrefix);
+  const subAs = buildAliasCtxMap(parent, dispatch.subDispatches, namePrefix);
+  return {
+    get sender() {
+      return parent.sender;
+    },
+    get databaseIdentity() {
+      return parent.databaseIdentity;
+    },
+    get identity() {
+      return parent.identity;
+    },
+    get timestamp() {
+      return parent.timestamp;
+    },
+    get connectionId() {
+      return parent.connectionId;
+    },
+    get senderAuth() {
+      return parent.senderAuth;
+    },
+    get random() {
+      return parent.random;
+    },
+    newUuidV4() {
+      return parent.newUuidV4();
+    },
+    newUuidV7() {
+      return parent.newUuidV7();
+    },
+    db: nsDb,
+    as: subAs,
+  };
+}
+
+function buildAliasCtxMap(
+  parent: InstanceType<typeof ReducerCtxImpl>,
+  dispatches: SubmoduleDispatchInfo[],
+  parentPrefix: string
+): object {
+  return freeze(
+    Object.fromEntries(
+      dispatches.map(d => [
+        d.namespace,
+        buildAliasCtx(parent, d, parentPrefix + d.namespace + '.'),
+      ])
+    )
+  );
+}
+
+function buildHandlerAliasCtx(
+  parent: HandlerContextImpl,
+  dispatch: SubmoduleDispatchInfo,
+  namePrefix: string
+): object {
+  // nsDb is built lazily inside withTx so that sys.table_id_from_name is called
+  // only after a transaction has been started (sys.procedure_start_mut_tx).
+  let nsDb_: DbView<any> | undefined;
+  const subAs = buildHandlerAliasCtxMap(
+    parent,
+    dispatch.subDispatches,
+    namePrefix
+  );
+  return {
+    get sender() {
+      return parent.sender;
+    },
+    get timestamp() {
+      return parent.timestamp;
+    },
+    get http() {
+      return parent.http;
+    },
+    get identity() {
+      return parent.identity;
+    },
+    get random() {
+      return parent.random;
+    },
+    as: subAs,
+    withTx(body: any) {
+      return runWithTx((ts: Timestamp) => {
+        const tx = new ReducerCtxImpl(
+          parent.sender,
+          ts,
+          null,
+          (nsDb_ ??= buildDbViewForDispatch(
+            dispatch,
+            namePrefix
+          ) as DbView<any>),
+          hostBackend,
+          HandlerContextImpl.senderAuth(parent)
+        );
+        assignTxAliasViews(tx, dispatch.subDispatches, namePrefix);
+        return tx;
+      }, body);
+    },
+    newUuidV4() {
+      return parent.newUuidV4();
+    },
+    newUuidV7() {
+      return parent.newUuidV7();
+    },
+  };
+}
+
+function buildHandlerAliasCtxMap(
+  parent: HandlerContextImpl,
+  dispatches: SubmoduleDispatchInfo[],
+  parentPrefix: string
+): object {
+  return freeze(
+    Object.fromEntries(
+      dispatches.map(d => [
+        d.namespace,
+        buildHandlerAliasCtx(parent, d, parentPrefix + d.namespace + '.'),
+      ])
+    )
+  );
+}
+
+type ProcCtxRef = {
+  sender: Identity;
+  connectionId: ConnectionId | null;
+  timestamp: Timestamp;
+  get databaseIdentity(): Identity;
+  get identity(): Identity;
+  get http(): HttpClient;
+  get random(): Random;
+  sleep(duration: { __time_duration_micros__: bigint }): void;
+  newUuidV4(): Uuid;
+  newUuidV7(): Uuid;
+};
+
+function buildProcedureAliasCtx(
+  parent: ProcCtxRef,
+  dispatch: SubmoduleDispatchInfo,
+  namePrefix: string
+): object {
+  // nsDb is built lazily inside withTx so that sys.table_id_from_name is called
+  // only after a transaction has been started (sys.procedure_start_mut_tx).
+  let nsDb_: DbView<any> | undefined;
+  const subAs = buildProcedureAliasCtxMap(
+    parent,
+    dispatch.subDispatches,
+    namePrefix
+  );
+  return {
+    get sender() {
+      return parent.sender;
+    },
+    get databaseIdentity() {
+      return parent.databaseIdentity;
+    },
+    get identity() {
+      return parent.identity;
+    },
+    get timestamp() {
+      return parent.timestamp;
+    },
+    get connectionId() {
+      return parent.connectionId;
+    },
+    get http() {
+      return parent.http;
+    },
+    get random() {
+      return parent.random;
+    },
+    sleep(duration: { __time_duration_micros__: bigint }) {
+      return parent.sleep(duration);
+    },
+    as: subAs,
+    withTx(body: any) {
+      return runWithTx((ts: Timestamp) => {
+        const tx = new ReducerCtxImpl(
+          parent.sender,
+          ts,
+          parent.connectionId,
+          (nsDb_ ??= buildDbViewForDispatch(
+            dispatch,
+            namePrefix
+          ) as DbView<any>)
+        );
+        assignTxAliasViews(tx, dispatch.subDispatches, namePrefix);
+        return tx;
+      }, body);
+    },
+    newUuidV4() {
+      return parent.newUuidV4();
+    },
+    newUuidV7() {
+      return parent.newUuidV7();
+    },
+  };
+}
+
+export function buildProcedureAliasCtxMap(
+  parent: ProcCtxRef,
+  dispatches: SubmoduleDispatchInfo[],
+  parentPrefix: string
+): object {
+  return freeze(
+    Object.fromEntries(
+      dispatches.map(d => [
+        d.namespace,
+        buildProcedureAliasCtx(parent, d, parentPrefix + d.namespace + '.'),
+      ])
+    )
+  );
+}
+
+/** Builds and assigns reducer-style alias views onto a freshly created TransactionCtx.
+ *  Must be called while inside a transaction (after sys.procedure_start_mut_tx). */
+export function assignTxAliasViews(
+  tx: InstanceType<typeof ReducerCtxImpl>,
+  dispatches: SubmoduleDispatchInfo[],
+  parentPrefix = ''
+): void {
+  if (dispatches.length > 0) {
+    tx.as = buildAliasCtxMap(tx, dispatches, parentPrefix) as any;
+  }
+}
+
+// TODO: Return OutboxTable when building an outbox, since it has no delete or clear.
+// This doesn't affect ctx.db: DbView gets its types from the schema's isOutbox
+// flag, rather than this function's return type.
+export function makeTableView(
   typespace: Typespace,
-  table: RawTableDefV10
+  table: RawTableDefV10,
+  backendOrNamePrefix: DatastoreBackend | string = hostBackend,
+  namePrefix = '',
+  isOutbox = false
 ): Table<any> {
-  const table_id = sys.table_id_from_name(table.sourceName);
+  const backend = isDatastoreBackend(backendOrNamePrefix)
+    ? backendOrNamePrefix
+    : hostBackend;
+  if (typeof backendOrNamePrefix === 'string') {
+    namePrefix = backendOrNamePrefix;
+  }
+  const table_id = backend.tableIdFromName(namePrefix + table.sourceName);
   const rowType = typespace.types[table.productTypeRef];
   if (rowType.tag !== 'Product') {
     throw 'impossible';
@@ -474,7 +1272,11 @@ function makeTableView(
   const hasAutoIncrement = sequences.length > 0;
 
   const iter = () =>
-    tableIterator(sys.datastore_table_scan_bsatn(table_id), deserializeRow);
+    tableIterator(
+      backend.datastoreTableScanBsatn(table_id),
+      deserializeRow,
+      backend
+    );
 
   const integrateGeneratedColumns = hasAutoIncrement
     ? (row: RowType<any>, ret_buf: DataView) => {
@@ -487,17 +1289,36 @@ function makeTableView(
       }
     : null;
 
+  const generatedColumnsView = (
+    generated: Uint8Array | number | void,
+    fallback: DataView
+  ) =>
+    generated instanceof Uint8Array
+      ? new DataView(
+          generated.buffer,
+          generated.byteOffset,
+          generated.byteLength
+        )
+      : fallback;
+
   const tableMethods: TableMethods<any> = {
-    count: () => sys.datastore_table_row_count(table_id),
+    count: () => BigInt(backend.datastoreTableRowCount(table_id)),
     iter,
     [Symbol.iterator]: () => iter(),
     insert: row => {
       const buf = LEAF_BUF;
       BINARY_WRITER.reset(buf);
       serializeRow(BINARY_WRITER, row);
-      sys.datastore_insert_bsatn(table_id, buf.buffer, BINARY_WRITER.offset);
+      const generated = backend.datastoreInsertBsatn(
+        table_id,
+        buf.buffer,
+        BINARY_WRITER.offset
+      );
       const ret = { ...row };
-      integrateGeneratedColumns?.(ret, buf.view);
+      integrateGeneratedColumns?.(
+        ret,
+        generatedColumnsView(generated, buf.view)
+      );
 
       return ret;
     },
@@ -506,14 +1327,18 @@ function makeTableView(
       BINARY_WRITER.reset(buf);
       BINARY_WRITER.writeU32(1);
       serializeRow(BINARY_WRITER, row);
-      const count = sys.datastore_delete_all_by_eq_bsatn(
+      const count = backend.datastoreDeleteAllByEqBsatn(
         table_id,
         buf.buffer,
         BINARY_WRITER.offset
       );
       return count > 0;
     },
-    clear: () => sys.datastore_clear(table_id),
+    clear: () => {
+      const count = BigInt(backend.datastoreTableRowCount(table_id));
+      backend.datastoreClear(table_id);
+      return count;
+    },
   };
 
   const tableView = Object.assign(
@@ -521,9 +1346,16 @@ function makeTableView(
     tableMethods
   ) as Table<any>;
 
+  if (isOutbox) {
+    // OutboxTable hides these methods from TypeScript. Remove them here so
+    // JavaScript callers can't use them either.
+    Reflect.deleteProperty(tableView, 'delete');
+    Reflect.deleteProperty(tableView, 'clear');
+  }
+
   for (const indexDef of table.indexes) {
     const accessorName = indexDef.accessorName!;
-    const index_id = sys.index_id_from_name(indexDef.sourceName!);
+    const index_id = backend.indexIdFromName(namePrefix + indexDef.sourceName!);
 
     let column_ids: number[];
     let isHashIndex = false;
@@ -544,7 +1376,10 @@ function makeTableView(
     const columnSet = new Set(column_ids);
     const isUnique = table.constraints
       .filter(x => x.data.tag === 'Unique')
-      .some(x => columnSet.isSubsetOf(new Set(x.data.value.columns)));
+      .some(x => {
+        const constraintColumns = new Set(x.data.value.columns);
+        return [...columnSet].every(column => constraintColumns.has(column));
+      });
 
     const isPrimaryKey =
       isUnique &&
@@ -591,17 +1426,17 @@ function makeTableView(
         find: (colVal: IndexVal<any, any>): RowType<any> | null => {
           const buf = LEAF_BUF;
           const point_len = serializeSinglePoint(buf, colVal);
-          const iter_id = sys.datastore_index_scan_point_bsatn(
+          const iter_id = backend.datastoreIndexScanPointBsatn(
             index_id,
             buf.buffer,
             point_len
           );
-          return tableIterateOne(iter_id, deserializeRow);
+          return tableIterateOne(iter_id, deserializeRow, backend);
         },
         delete: (colVal: IndexVal<any, any>): boolean => {
           const buf = LEAF_BUF;
           const point_len = serializeSinglePoint(buf, colVal);
-          const num = sys.datastore_delete_by_index_scan_point_bsatn(
+          const num = backend.datastoreDeleteByIndexScanPointBsatn(
             index_id,
             buf.buffer,
             point_len
@@ -614,13 +1449,16 @@ function makeTableView(
           const buf = LEAF_BUF;
           BINARY_WRITER.reset(buf);
           serializeRow(BINARY_WRITER, row);
-          sys.datastore_update_bsatn(
+          const generated = backend.datastoreUpdateBsatn(
             table_id,
             index_id,
             buf.buffer,
             BINARY_WRITER.offset
           );
-          integrateGeneratedColumns?.(row, buf.view);
+          integrateGeneratedColumns?.(
+            row,
+            generatedColumnsView(generated, buf.view)
+          );
           return row;
         };
       }
@@ -634,12 +1472,12 @@ function makeTableView(
           }
           const buf = LEAF_BUF;
           const point_len = serializePoint(buf, colVal);
-          const iter_id = sys.datastore_index_scan_point_bsatn(
+          const iter_id = backend.datastoreIndexScanPointBsatn(
             index_id,
             buf.buffer,
             point_len
           );
-          return tableIterateOne(iter_id, deserializeRow);
+          return tableIterateOne(iter_id, deserializeRow, backend);
         },
         delete: (colVal: IndexVal<any, any>): boolean => {
           if (colVal.length !== numColumns)
@@ -647,7 +1485,7 @@ function makeTableView(
 
           const buf = LEAF_BUF;
           const point_len = serializePoint(buf, colVal);
-          const num = sys.datastore_delete_by_index_scan_point_bsatn(
+          const num = backend.datastoreDeleteByIndexScanPointBsatn(
             index_id,
             buf.buffer,
             point_len
@@ -660,13 +1498,16 @@ function makeTableView(
           const buf = LEAF_BUF;
           BINARY_WRITER.reset(buf);
           serializeRow(BINARY_WRITER, row);
-          sys.datastore_update_bsatn(
+          const generated = backend.datastoreUpdateBsatn(
             table_id,
             index_id,
             buf.buffer,
             BINARY_WRITER.offset
           );
-          integrateGeneratedColumns?.(row, buf.view);
+          integrateGeneratedColumns?.(
+            row,
+            generatedColumnsView(generated, buf.view)
+          );
           return row;
         };
       }
@@ -697,33 +1538,33 @@ function makeTableView(
           const buf = LEAF_BUF;
           if (serializeSingleRange && range instanceof Range) {
             const args = serializeSingleRange(buf, range);
-            const iter_id = sys.datastore_index_scan_range_bsatn(
+            const iter_id = backend.datastoreIndexScanRangeBsatn(
               index_id,
               buf.buffer,
               ...args
             );
-            return tableIterator(iter_id, deserializeRow);
+            return tableIterator(iter_id, deserializeRow, backend);
           }
           const point_len = serializeSinglePoint(buf, range);
-          const iter_id = sys.datastore_index_scan_point_bsatn(
+          const iter_id = backend.datastoreIndexScanPointBsatn(
             index_id,
             buf.buffer,
             point_len
           );
-          return tableIterator(iter_id, deserializeRow);
+          return tableIterator(iter_id, deserializeRow, backend);
         },
         delete: (range: any): u32 => {
           const buf = LEAF_BUF;
           if (serializeSingleRange && range instanceof Range) {
             const args = serializeSingleRange(buf, range);
-            return sys.datastore_delete_by_index_scan_range_bsatn(
+            return backend.datastoreDeleteByIndexScanRangeBsatn(
               index_id,
               buf.buffer,
               ...args
             );
           }
           const point_len = serializeSinglePoint(buf, range);
-          return sys.datastore_delete_by_index_scan_point_bsatn(
+          return backend.datastoreDeleteByIndexScanPointBsatn(
             index_id,
             buf.buffer,
             point_len
@@ -741,17 +1582,17 @@ function makeTableView(
         filter: (range: any[]): IteratorObject<RowType<any>> => {
           const buf = LEAF_BUF;
           const point_len = serializePoint(buf, range);
-          const iter_id = sys.datastore_index_scan_point_bsatn(
+          const iter_id = backend.datastoreIndexScanPointBsatn(
             index_id,
             buf.buffer,
             point_len
           );
-          return tableIterator(iter_id, deserializeRow);
+          return tableIterator(iter_id, deserializeRow, backend);
         },
         delete: (range: any[]): u32 => {
           const buf = LEAF_BUF;
           const point_len = serializePoint(buf, range);
-          return sys.datastore_delete_by_index_scan_point_bsatn(
+          return backend.datastoreDeleteByIndexScanPointBsatn(
             index_id,
             buf.buffer,
             point_len
@@ -760,6 +1601,16 @@ function makeTableView(
       } as PointIndex<any, any>;
     } else {
       // numColumns != 1
+      const isCompleteScalarKey = (range: any[]): boolean => {
+        // Preserve the point-scan path only for complete scalar keys.
+        // A complete key with a Range in the final position is still a range
+        // scan over that column with equality over the preceding prefix.
+        return (
+          range.length === numColumns &&
+          !(range[range.length - 1] instanceof Range)
+        );
+      };
+
       const serializeRange = (
         buffer: ResizableBuffer,
         range: any[]
@@ -784,43 +1635,48 @@ function makeTableView(
           writeBound(term.from);
           const rstartLen = writer.offset - rstartOffset;
           writeBound(term.to);
-          const rendLen = writer.offset - rstartLen;
+          const rendLen = writer.offset - rstartOffset - rstartLen;
           return [rstartOffset, prefix_elems, rstartLen, rendLen];
         } else {
           writer.writeU8(0);
           serializeTerm(writer, term);
-          const rstartLen = writer.offset;
+          const rstartLen = writer.offset - rstartOffset;
           const rendLen = 0;
           return [rstartOffset, prefix_elems, rstartLen, rendLen];
         }
       };
       index = {
         filter: (range: any[]): IteratorObject<RowType<any>> => {
-          if (range.length === numColumns) {
+          // A bare scalar or `Range` is the only type-valid way to express a
+          // one-column prefix scan; normalize it to a single-element array so
+          // `.length` and `serializeRange` see a prefix rather than NaN.
+          if (!Array.isArray(range)) range = [range];
+          if (isCompleteScalarKey(range)) {
             const buf = LEAF_BUF;
             const point_len = serializePoint(buf, range);
-            const iter_id = sys.datastore_index_scan_point_bsatn(
+            const iter_id = backend.datastoreIndexScanPointBsatn(
               index_id,
               buf.buffer,
               point_len
             );
-            return tableIterator(iter_id, deserializeRow);
+            return tableIterator(iter_id, deserializeRow, backend);
           } else {
             const buf = LEAF_BUF;
             const args = serializeRange(buf, range);
-            const iter_id = sys.datastore_index_scan_range_bsatn(
+            const iter_id = backend.datastoreIndexScanRangeBsatn(
               index_id,
               buf.buffer,
               ...args
             );
-            return tableIterator(iter_id, deserializeRow);
+            return tableIterator(iter_id, deserializeRow, backend);
           }
         },
         delete: (range: any[]): u32 => {
-          if (range.length === numColumns) {
+          if (!Array.isArray(range)) range = [range];
+          if (isCompleteScalarKey(range)) {
             const buf = LEAF_BUF;
             const point_len = serializePoint(buf, range);
-            return sys.datastore_delete_by_index_scan_point_bsatn(
+            return backend.datastoreDeleteByIndexScanPointBsatn(
               index_id,
               buf.buffer,
               point_len
@@ -828,7 +1684,7 @@ function makeTableView(
           } else {
             const buf = LEAF_BUF;
             const args = serializeRange(buf, range);
-            return sys.datastore_delete_by_index_scan_range_bsatn(
+            return backend.datastoreDeleteByIndexScanRangeBsatn(
               index_id,
               buf.buffer,
               ...args
@@ -836,6 +1692,12 @@ function makeTableView(
           }
         },
       } as RangedIndex<any, any>;
+    }
+
+    if (isOutbox) {
+      // Outbox indexes must also prevent deletes and updates at runtime.
+      Reflect.deleteProperty(index, 'delete');
+      Reflect.deleteProperty(index, 'update');
     }
 
     // IMPORTANT: duplicate accessor handling.
@@ -853,9 +1715,10 @@ function makeTableView(
 
 function* tableIterator<T>(
   id: u32,
-  deserialize: Deserializer<T>
+  deserialize: Deserializer<T>,
+  backend: DatastoreBackend = hostBackend
 ): Generator<T, undefined> {
-  using iter = new IteratorHandle(id);
+  const iter = new IteratorHandle(id, backend);
 
   const iterBuf = takeBuf();
   try {
@@ -867,15 +1730,20 @@ function* tableIterator<T>(
       }
     }
   } finally {
+    iter[Symbol.dispose]();
     returnBuf(iterBuf);
   }
 }
 
-function tableIterateOne<T>(id: u32, deserialize: Deserializer<T>): T | null {
+function tableIterateOne<T>(
+  id: u32,
+  deserialize: Deserializer<T>,
+  backend: DatastoreBackend = hostBackend
+): T | null {
   const buf = LEAF_BUF;
   // we only need to check for the `<= 0` case, since this function is only used
   // with iterators that should only have zero or one element.
-  const ret = advanceIterRaw(id, buf);
+  const ret = advanceIterRaw(id, buf, backend);
   if (ret !== 0) {
     BINARY_READER.reset(buf.view);
     return deserialize(BINARY_READER);
@@ -888,10 +1756,14 @@ function tableIterateOne<T>(id: u32, deserialize: Deserializer<T>): T | null {
  * `ret === 0` means the iterator was empty and has been destroyed.
  * `ret > 0` means the iterator yielded elements and has more to give.
  */
-function advanceIterRaw(id: u32, buf: ResizableBuffer): number {
+function advanceIterRaw(
+  id: u32,
+  buf: ResizableBuffer,
+  backend: DatastoreBackend = hostBackend
+): number {
   while (true) {
     try {
-      return 0 | sys.row_iter_bsatn_advance(id, buf.buffer);
+      return 0 | backend.rowIterBsatnAdvance(id, buf.buffer);
     } catch (e) {
       if (e && typeof e === 'object' && hasOwn(e, '__buffer_too_small__')) {
         buf.grow(e.__buffer_too_small__ as number);
@@ -931,14 +1803,17 @@ const LEAF_BUF = new ResizableBuffer(DEFAULT_BUFFER_CAPACITY);
 /** A class to manage the lifecycle of an iterator handle. */
 class IteratorHandle implements Disposable {
   #id: u32 | -1;
+  #backend: DatastoreBackend;
 
-  static #finalizationRegistry = new FinalizationRegistry<u32>(
-    sys.row_iter_bsatn_close
-  );
+  static #finalizationRegistry = new FinalizationRegistry<{
+    id: u32;
+    backend: DatastoreBackend;
+  }>(({ id, backend }) => backend.rowIterBsatnClose(id));
 
-  constructor(id: u32) {
+  constructor(id: u32, backend: DatastoreBackend = hostBackend) {
     this.#id = id;
-    IteratorHandle.#finalizationRegistry.register(this, id, this);
+    this.#backend = backend;
+    IteratorHandle.#finalizationRegistry.register(this, { id, backend }, this);
   }
 
   /** Unregister this object with the finalization registry and return the id */
@@ -952,7 +1827,7 @@ class IteratorHandle implements Disposable {
   /** Call `row_iter_bsatn_advance`, returning 0 if this iterator has been exhausted. */
   advance(buf: ResizableBuffer): number {
     if (this.#id === -1) return 0;
-    const ret = advanceIterRaw(this.#id, buf);
+    const ret = advanceIterRaw(this.#id, buf, this.#backend);
     if (ret <= 0) this.#detach();
     return ret < 0 ? -ret : ret;
   }
@@ -960,7 +1835,7 @@ class IteratorHandle implements Disposable {
   [Symbol.dispose]() {
     if (this.#id >= 0) {
       const id = this.#detach();
-      sys.row_iter_bsatn_close(id);
+      this.#backend.rowIterBsatnClose(id);
     }
   }
 }

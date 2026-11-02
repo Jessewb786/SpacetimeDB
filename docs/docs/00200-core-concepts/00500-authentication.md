@@ -11,13 +11,51 @@ needs, or even implement your own.
 If you're new to OIDC, check out our [blog post about OIDC](https://spacetimedb.com/blog/who-are-you)
 to learn more about how OIDC works and why it's a great choice for authentication.
 
+## Server-issued tokens and reconnects
+
+If a client connects without supplying a token, SpacetimeDB creates a new
+identity and returns a server-issued token for that identity. If you want later
+connections to keep using that same identity, persist that returned token and
+pass it back into the SDK on reconnect.
+
+On platforms that can send an `Authorization` header during the WebSocket
+handshake, the SDK can reuse that saved token directly. On platforms that cannot
+set custom WebSocket headers, the SDK first exchanges the saved token for a
+short-lived WebSocket token through
+[`POST /v1/identity/websocket-token`](/docs/http/identity#post-v1identitywebsocket-token),
+then sends only that short-lived token in the WebSocket URL.
+
+This matters when you persist tokens on the client:
+
+- Save the long-lived server-issued token that establishes the user's identity.
+- Do not overwrite an already-saved long-lived token with a short-lived
+  WebSocket token received during reconnect.
+- Expect this distinction on browser-style transports where WebSocket headers
+  are unavailable, such as Unity WebGL builds.
+
+For C# clients with `.WithAutomaticReconnect()` enabled, the SDK retains the
+authentication token and reuses it during recovery. `OnConnect` receives it on
+the initial connection; `OnAutomaticReconnect` receives the retained or refreshed
+token after each successful recovery. Persist tokens from both callbacks for
+future application sessions. This also applies on Unity WebGL: these callbacks
+receive the authentication token, rather than the transport's short-lived token.
+The WebGL precaution above still applies to C# connections without automatic reconnect.
+
+For expiring credentials, also configure `.WithTokenProvider(() => RefreshTokenAsync())`.
+Supply the initial token through `.WithToken(initialToken)`; the provider is only
+used during automatic reconnect. It returns a token for the same identity when
+the retained token is near expiry, its expiry cannot be read, or a reused token
+has been rejected. The SDK does not refresh tokens periodically while connected.
+See the [C# token-provider reference](./00600-clients/00600-csharp-reference.md#method-withtokenprovider)
+for refresh timing, rejection handling, and cancellation behavior.
+
 ## SpacetimeAuth
 
 To make it easier to get started with authentication, SpacetimeDB offers
-[SpacetimeAuth](https://spacetimedb.com/docs/spacetimeauth), a fully managed
-OIDC provider built specifically for SpacetimeDB applications. SpacetimeAuth handles
-user management, authentication flows, and token issuance, so you don't have to
-worry about building and maintaining your own authentication service.
+[SpacetimeAuth](./00500-authentication/00100-spacetimeauth/index.md), a fully
+managed OIDC provider built specifically for SpacetimeDB applications. SpacetimeAuth
+handles user management, authentication flows, and token issuance, so you don't have
+to worry about building and maintaining your own authentication service.
 
 SpacetimeAuth is meant to be simple to use and easy to integrate with SpacetimeDB.
 While being production-ready and able to support most common use cases, it is not
@@ -46,7 +84,7 @@ Sometimes, you may need to authenticate your servers, APIs or other services tha
 interact with your SpacetimeDB database. OIDC tokens can also be used for this
 purpose, allowing secure communication between your services and SpacetimeDB.
 
-To authenticate your services, you have e few options depending on your OIDC provider:
+To authenticate your services, you have a few options depending on your OIDC provider:
 
 - **Client credentials flow**: Many OIDC providers support the client credentials
   flow, which allows your service to obtain an access token using its own

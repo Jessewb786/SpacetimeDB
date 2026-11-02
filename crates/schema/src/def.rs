@@ -20,7 +20,7 @@ use std::fmt::{self, Debug, Write};
 use std::hash::Hash;
 
 use crate::error::{IdentifierError, ValidationErrors};
-use crate::identifier::Identifier;
+use crate::identifier::{Identifier, NamespacePath, NamespacedIdentifier};
 use crate::reducer_name::ReducerName;
 use crate::schema::{Schema, TableSchema};
 use crate::type_for_generate::{AlgebraicTypeUse, ProductTypeDef, TypespaceForGenerate};
@@ -32,9 +32,11 @@ use spacetimedb_data_structures::error_stream::{CollectAllErrors, CombineErrors,
 use spacetimedb_data_structures::map::{Equivalent, HashMap};
 use spacetimedb_lib::db::raw_def;
 use spacetimedb_lib::db::raw_def::v10::{
-    ExplicitNames, RawConstraintDefV10, RawIndexDefV10, RawLifeCycleReducerDefV10, RawModuleDefV10,
-    RawModuleDefV10Section, RawModuleMountV10, RawProcedureDefV10, RawReducerDefV10, RawRowLevelSecurityDefV10,
-    RawScheduleDefV10, RawScopedTypeNameV10, RawSequenceDefV10, RawTableDefV10, RawTypeDefV10, RawViewDefV10,
+    ExplicitNames, MethodOrAny, RawColumnDefaultValueV10, RawConstraintDefV10, RawHttpHandlerDefV10,
+    RawHttpRouteDefV10, RawIndexDefV10, RawLifeCycleReducerDefV10, RawModuleDefV10, RawModuleDefV10Section,
+    RawOutboxDefV10, RawProcedureDefV10, RawReducerDefV10, RawRowLevelSecurityDefV10, RawScheduleDefV10,
+    RawScopedTypeNameV10, RawSequenceDefV10, RawSubmoduleV10, RawTableDefV10, RawTypeDefV10, RawViewDefV10,
+    RawViewPrimaryKeyDefV10,
 };
 use spacetimedb_lib::db::raw_def::v9::{
     Lifecycle, RawColumnDefaultValueV9, RawConstraintDataV9, RawConstraintDefV9, RawIndexAlgorithm, RawIndexDefV9,
@@ -42,10 +44,14 @@ use spacetimedb_lib::db::raw_def::v9::{
     RawScheduleDefV9, RawScopedTypeNameV9, RawSequenceDefV9, RawSql, RawTableDefV9, RawTypeDefV9,
     RawUniqueConstraintDataV9, RawViewDefV9, TableAccess, TableType,
 };
-use spacetimedb_lib::{ProductType, RawModuleDef};
-use spacetimedb_primitives::{ColId, ColList, ColOrCols, ColSet, ProcedureId, ReducerId, TableId, ViewFnPtr};
+use spacetimedb_lib::db::view::{extract_view_return_product_type_ref, ViewKind};
+use spacetimedb_lib::environment::EnvironmentSchema;
+use spacetimedb_lib::{hash_bytes, Hash as SpacetimeHash, ProductType, RawModuleDef};
+use spacetimedb_primitives::{
+    ColId, ColList, ColOrCols, ColSet, HttpHandlerId, ProcedureId, ReducerId, TableId, ViewFnPtr,
+};
 use spacetimedb_sats::raw_identifier::RawIdentifier;
-use spacetimedb_sats::{AlgebraicType, AlgebraicTypeRef, AlgebraicValue, Typespace};
+use spacetimedb_sats::{bsatn, AlgebraicType, AlgebraicTypeRef, AlgebraicValue, Typespace};
 
 pub mod deserialize;
 pub mod error;
@@ -72,7 +78,7 @@ pub type StrMap<T> = HashMap<RawIdentifier, T>;
 /// use spacetimedb_lib::RawModuleDef;
 /// use spacetimedb_sats::raw_identifier::RawIdentifier;
 /// use spacetimedb_schema::def::{ModuleDef, TableDef, IndexDef, TypeDef, ModuleDefLookup, ScopedTypeName};
-/// use spacetimedb_schema::identifier::Identifier;
+/// use spacetimedb_schema::identifier::{Identifier, NamespacePath};
 ///
 /// fn read_raw_module_def_from_file() -> RawModuleDef {
 ///     // ...
@@ -86,8 +92,13 @@ pub type StrMap<T> = HashMap<RawIdentifier, T>;
 /// let index_name: RawIdentifier = "my_table_my_column_idx_btree".into();
 /// let scoped_type_name = ScopedTypeName::try_new([], "MyType").expect("valid scoped type name");
 ///
-/// let table: Option<&TableDef> = module_def.lookup(&table_name);
-/// let index: Option<&IndexDef> = module_def.lookup(&index_name);
+/// // Items owned by a module are keyed by `(namespace, name)`, where the namespace is the
+/// // path the owning module is mounted under -- empty for the root module.
+/// let root = NamespacePath::root();
+///
+/// let table: Option<&TableDef> = module_def.lookup((&root, &table_name));
+/// let index: Option<&IndexDef> = module_def.lookup((&root, &index_name));
+/// // Types are keyed by their scoped name, which is already unique across the module.
 /// let type_def: Option<&TypeDef> = module_def.lookup(&scoped_type_name);
 /// // etc.
 /// ```
@@ -101,6 +112,16 @@ pub type StrMap<T> = HashMap<RawIdentifier, T>;
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct ModuleDef {
+    /// The canonical namespace path this module is mounted under, empty for the root.
+    ///
+    /// Maintained by [`ModuleDef::apply_namespace`] alongside the `namespace` of every def,
+    /// and used to resolve namespace-qualified keys relative to whichever module they are
+    /// looked up in.
+    path: NamespacePath,
+
+    /// The accessor namespace path this module is mounted under, empty for the root.
+    accessor_path: NamespacePath,
+
     /// The tables of the module definition.
     tables: IdentifierMap<TableDef>,
 
@@ -114,6 +135,15 @@ pub struct ModuleDef {
     /// Like `reducers`, this uses [`IndexMap`] to preserve order
     /// so that `__call_procedure__` receives stable integer IDs.
     procedures: IndexMap<Identifier, ProcedureDef>,
+
+    /// The HTTP handlers of the module definition.
+    ///
+    /// Uses [`IndexMap`] to preserve order so that `__call_http_handler__`
+    /// receives stable integer IDs.
+    http_handlers: IndexMap<Identifier, HttpHandlerDef>,
+
+    /// The HTTP routes of the module definition.
+    http_routes: Vec<HttpRouteDef>,
 
     /// The views of the module definition.
     ///
@@ -152,8 +182,11 @@ pub struct ModuleDef {
     #[allow(unused)]
     raw_module_def_version: RawModuleDefVersion,
 
-    /// Mounted submodules, keyed by the namespace they are mounted under.
-    mounts: IndexMap<String, ModuleDef>,
+    /// Submodules, keyed by the canonical namespace they are registered under.
+    submodules: IndexMap<Identifier, ModuleDef>,
+
+    /// `None` means undeclared; an explicitly empty declaration is `Some(empty)`.
+    environment: Option<EnvironmentSchema>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -165,14 +198,37 @@ pub enum RawModuleDefVersion {
 }
 
 impl ModuleDef {
+    /// The validated root environment schema. Legacy modules have an empty schema.
+    pub fn environment(&self) -> &EnvironmentSchema {
+        match &self.environment {
+            Some(schema) => schema,
+            None => const { &EnvironmentSchema::empty() },
+        }
+    }
+
     /// The raw module definition version this module was authored under.
     pub fn raw_module_def_version(&self) -> RawModuleDefVersion {
         self.raw_module_def_version
     }
 
-    /// The mounted submodules of the module definition.
-    pub fn mounts(&self) -> &IndexMap<String, ModuleDef> {
-        &self.mounts
+    /// The submodules of the module definition, keyed by canonical namespace.
+    pub fn submodules(&self) -> &IndexMap<Identifier, ModuleDef> {
+        &self.submodules
+    }
+
+    /// The canonical namespace path this module is mounted under, empty for the root.
+    pub fn path(&self) -> &NamespacePath {
+        &self.path
+    }
+
+    /// The accessor namespace path this module is mounted under, empty for the root.
+    pub fn accessor_path(&self) -> &NamespacePath {
+        &self.accessor_path
+    }
+
+    /// The accessor name this module is mounted under in its parent, `None` for the root.
+    pub fn mount_accessor_name(&self) -> Option<&Identifier> {
+        self.accessor_path.segments().last()
     }
 
     /// The tables of the module definition.
@@ -200,19 +256,314 @@ impl ModuleDef {
         self.tables().filter_map(|table| table.schedule.as_ref())
     }
 
+    /// All tables across this module and all submodules, in depth-first order.
+    ///
+    /// Each item is `(path, owning_def, table_def)` where `path` is the namespace path
+    /// to be prepended to the table's name for database storage (empty for the root).
+    pub fn all_tables_with_prefix(&self) -> Vec<(NamespacePath, &ModuleDef, &TableDef)> {
+        let mut out = Vec::new();
+        self.collect_tables_with_prefix(&NamespacePath::root(), &mut out);
+        out
+    }
+
+    fn collect_tables_with_prefix<'a>(
+        &'a self,
+        prefix: &NamespacePath,
+        out: &mut Vec<(NamespacePath, &'a ModuleDef, &'a TableDef)>,
+    ) {
+        for table in self.tables.values() {
+            out.push((prefix.clone(), self, table));
+        }
+        for (ns, submodule) in &self.submodules {
+            submodule.collect_tables_with_prefix(&prefix.child(ns.clone()), out);
+        }
+    }
+
+    /// All views across this module and all submodules, in depth-first order.
+    ///
+    /// Each item is `(path, owning_def, view_def)` where `path` is the namespace path
+    /// to be prepended to the view's name (empty for the root).
+    pub fn all_views_with_prefix(&self) -> Vec<(NamespacePath, &ModuleDef, &ViewDef)> {
+        let mut out = Vec::new();
+        self.collect_views_with_prefix(&NamespacePath::root(), &mut out);
+        out
+    }
+
+    fn collect_views_with_prefix<'a>(
+        &'a self,
+        prefix: &NamespacePath,
+        out: &mut Vec<(NamespacePath, &'a ModuleDef, &'a ViewDef)>,
+    ) {
+        for view in self.views.values() {
+            out.push((prefix.clone(), self, view));
+        }
+        for (ns, submodule) in &self.submodules {
+            submodule.collect_views_with_prefix(&prefix.child(ns.clone()), out);
+        }
+    }
+
+    /// Record the namespace path of this module on every def it owns, recursively.
+    ///
+    /// A def's [`ModuleDefLookup`] key is `(namespace, name)`, and a def cannot otherwise
+    /// know which namespace it is mounted under: submodules are validated in isolation, so
+    /// this runs once the module tree is assembled.
+    fn apply_namespace(&mut self, path: &NamespacePath, accessor_path: &NamespacePath) {
+        self.path = path.clone();
+        self.accessor_path = accessor_path.clone();
+        for table in self.tables.values_mut() {
+            table.namespace = path.clone();
+            for index in table.indexes.values_mut() {
+                index.namespace = path.clone();
+            }
+            for sequence in table.sequences.values_mut() {
+                sequence.namespace = path.clone();
+            }
+            for constraint in table.constraints.values_mut() {
+                constraint.namespace = path.clone();
+            }
+            if let Some(schedule) = &mut table.schedule {
+                schedule.namespace = path.clone();
+            }
+            if let Some(callback) = table
+                .outbox
+                .as_mut()
+                .and_then(|outbox| outbox.on_result_reducer.as_mut())
+            {
+                *callback = ReducerName::new(path.join(callback.local().clone()));
+            }
+        }
+        for view in self.views.values_mut() {
+            view.namespace = path.clone();
+        }
+        for reducer in self.reducers.values_mut() {
+            reducer.name = ReducerName::new(path.join(reducer.name.local().clone()));
+        }
+        for (namespace, submodule) in &mut self.submodules {
+            let accessor = submodule
+                .mount_accessor_name()
+                .cloned()
+                .unwrap_or_else(|| namespace.clone());
+            submodule.apply_namespace(&path.child(namespace.clone()), &accessor_path.child(accessor));
+        }
+    }
+
+    /// Debug-only check that every def's recorded namespace matches its module.
+    #[cfg(debug_assertions)]
+    fn assert_namespaces_applied(&self, path: &NamespacePath) {
+        debug_assert_eq!(&self.path, path, "module path stale");
+        debug_assert_eq!(
+            self.accessor_path.segments().len(),
+            path.segments().len(),
+            "accessor path depth mismatch"
+        );
+        for table in self.tables.values() {
+            debug_assert_eq!(&table.namespace, path, "table namespace stale");
+            for index in table.indexes.values() {
+                debug_assert_eq!(&index.namespace, path, "index namespace stale");
+            }
+        }
+        for view in self.views.values() {
+            debug_assert_eq!(&view.namespace, path, "view namespace stale");
+        }
+        for (namespace, submodule) in &self.submodules {
+            submodule.assert_namespaces_applied(&path.child(namespace.clone()));
+        }
+    }
+
+    /// Resolve the submodule mounted at `path`, relative to this module.
+    fn resolve_path(&self, path: &NamespacePath) -> Option<&ModuleDef> {
+        // Keys are qualified from the root, so drop the part of the path we already are.
+        let rest = path.segments().strip_prefix(self.path.segments())?;
+        let mut owning = self;
+        for namespace in rest {
+            owning = owning.submodules.get(namespace)?;
+        }
+        Some(owning)
+    }
+
+    /// Look up a table by its [`ModuleDefLookup`] key, also returning the module that owns it.
+    ///
+    /// The owning module is needed to resolve the table's type refs, which point into that
+    /// module's typespace rather than the root's.
+    pub fn find_table(&self, key: <TableDef as ModuleDefLookup>::Key<'_>) -> Option<(&ModuleDef, &TableDef)> {
+        let owning = self.resolve_path(key.0)?;
+        Some((owning, owning.tables.get(key.1)?))
+    }
+
+    /// Look up a view by its [`ModuleDefLookup`] key, also returning the module that owns it.
+    pub fn find_view(&self, key: <ViewDef as ModuleDefLookup>::Key<'_>) -> Option<(&ModuleDef, &ViewDef)> {
+        let owning = self.resolve_path(key.0)?;
+        Some((owning, owning.views.get(key.1)?))
+    }
+
+    /// The table that stores the sub-object (index, sequence, constraint or schedule)
+    /// named `name` in the module mounted at `namespace`.
+    pub fn find_storing_table(
+        &self,
+        namespace: &NamespacePath,
+        name: &RawIdentifier,
+    ) -> Option<(&ModuleDef, &TableDef)> {
+        let owning = self.resolve_path(namespace)?;
+        Some((owning, owning.stored_in_table_def(name)?))
+    }
+
     /// The reducers of the module definition.
     pub fn reducers(&self) -> impl Iterator<Item = &ReducerDef> {
         self.reducers.values()
     }
 
-    /// Returns an iterator over all reducer ids and definitions.
-    pub fn reducer_ids_and_defs(&self) -> impl ExactSizeIterator<Item = (ReducerId, &ReducerDef)> {
-        self.reducers.values().enumerate().map(|(idx, def)| (idx.into(), def))
+    /// Returns all reducer ids and definitions in depth-first submodule order.
+    ///
+    /// IDs are assigned as follows: consumer's own reducers first (0..N), then each
+    /// submodule's reducers in the order they appear in `submodules`, recursively.
+    pub fn reducer_ids_and_defs(&self) -> Vec<(ReducerId, &ReducerDef)> {
+        let mut out = Vec::with_capacity(self.reducer_count());
+        self.collect_reducers(0, &mut out);
+        out
+    }
+
+    /// Total reducer count including all submodules (depth-first sum).
+    pub fn reducer_count(&self) -> usize {
+        self.reducers.len() + self.submodules.values().map(|m| m.reducer_count()).sum::<usize>()
+    }
+
+    fn collect_reducers<'a>(&'a self, offset: usize, out: &mut Vec<(ReducerId, &'a ReducerDef)>) {
+        for (i, def) in self.reducers.values().enumerate() {
+            out.push(((offset + i).into(), def));
+        }
+        let mut child_offset = offset + self.reducers.len();
+        for submodule in self.submodules.values() {
+            submodule.collect_reducers(child_offset, out);
+            child_offset += submodule.reducer_count();
+        }
+    }
+
+    /// All reducers across this module and all submodules, in depth-first order.
+    ///
+    /// Each item is `(path, owning_def, reducer_def)` where `path` is the namespace path
+    /// to be prepended to the reducer's name as its wire name (empty for the root).
+    pub fn all_reducers_with_prefix(&self) -> Vec<(NamespacePath, &ModuleDef, &ReducerDef)> {
+        let mut out = Vec::new();
+        self.collect_reducers_with_prefix(&NamespacePath::root(), &mut out);
+        out
+    }
+
+    fn collect_reducers_with_prefix<'a>(
+        &'a self,
+        prefix: &NamespacePath,
+        out: &mut Vec<(NamespacePath, &'a ModuleDef, &'a ReducerDef)>,
+    ) {
+        for reducer in self.reducers.values() {
+            out.push((prefix.clone(), self, reducer));
+        }
+        for (ns, submodule) in &self.submodules {
+            submodule.collect_reducers_with_prefix(&prefix.child(ns.clone()), out);
+        }
+    }
+
+    /// All procedures across this module and all submodules, in depth-first order.
+    ///
+    /// Each item is `(path, owning_def, procedure_def)` where `path` is the namespace path
+    /// to be prepended to the procedure's name as its wire name (empty for the root).
+    pub fn all_procedures_with_prefix(&self) -> Vec<(NamespacePath, &ModuleDef, &ProcedureDef)> {
+        let mut out = Vec::new();
+        self.collect_procedures_with_prefix(&NamespacePath::root(), &mut out);
+        out
+    }
+
+    fn collect_procedures_with_prefix<'a>(
+        &'a self,
+        prefix: &NamespacePath,
+        out: &mut Vec<(NamespacePath, &'a ModuleDef, &'a ProcedureDef)>,
+    ) {
+        for procedure in self.procedures.values() {
+            out.push((prefix.clone(), self, procedure));
+        }
+        for (ns, submodule) in &self.submodules {
+            submodule.collect_procedures_with_prefix(&prefix.child(ns.clone()), out);
+        }
     }
 
     /// The procedures of the module definition.
     pub fn procedures(&self) -> impl Iterator<Item = &ProcedureDef> {
         self.procedures.values()
+    }
+
+    /// The HTTP handlers of the module definition.
+    pub fn http_handlers(&self) -> impl Iterator<Item = &HttpHandlerDef> {
+        self.http_handlers.values()
+    }
+
+    /// The HTTP routes of the module definition.
+    pub fn http_routes(&self) -> &[HttpRouteDef] {
+        &self.http_routes
+    }
+
+    /// Returns warnings about this module's definition that will not prevent publishing.
+    ///
+    /// - Warns when a submodule registers HTTP routes via a top-level router export
+    ///   because those routes are ignored by the host.
+    pub fn collect_warnings(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        for (namespace, submodule_def) in self.submodules() {
+            if !submodule_def.http_routes().is_empty() {
+                // Module code narrows contexts by accessor name, not by canonical namespace.
+                let accessor = submodule_def.mount_accessor_name().unwrap_or(namespace);
+                warnings.push(format!(
+                    "The submodule under namespace '{namespace}' registers HTTP routes via a router. \
+                     Route registrations in submodules are ignored. Only the root module's routes \
+                     are served. Define routes in the root module and call the submodule's HTTP handler \
+                     functions via `ctx.as.{accessor}`."
+                ));
+            }
+            warnings.extend(submodule_def.collect_warnings());
+        }
+        warnings
+    }
+
+    /// Returns an iterator over all HTTP handler ids and definitions.
+    pub fn http_handler_ids_and_defs(&self) -> impl ExactSizeIterator<Item = (HttpHandlerId, &HttpHandlerDef)> {
+        self.http_handlers
+            .values()
+            .enumerate()
+            .map(|(idx, def)| (idx.into(), def))
+    }
+
+    pub fn http_handler_by_id(&self, id: HttpHandlerId) -> &HttpHandlerDef {
+        &self.http_handlers[id.0 as usize]
+    }
+
+    pub fn get_http_handler_by_id(&self, id: HttpHandlerId) -> Option<&HttpHandlerDef> {
+        self.http_handlers.get_index(id.0 as usize).map(|(_, def)| def)
+    }
+
+    pub fn http_handler_full<K: ?Sized + Hash + Equivalent<Identifier>>(
+        &self,
+        name: &K,
+    ) -> Option<(HttpHandlerId, &HttpHandlerDef)> {
+        let (idx, _key, def) = self.http_handlers.get_full(name)?;
+        Some((HttpHandlerId(idx as u32), def))
+    }
+
+    pub fn match_http_route(
+        &self,
+        method: &spacetimedb_lib::http::Method,
+        path: &str,
+    ) -> Option<(HttpHandlerId, &HttpHandlerDef, &HttpRouteDef)> {
+        // TODO(perf): Replace this linear scan with a trie or other indexed routing structure.
+        for route in &self.http_routes {
+            if route.path.as_ref() != path {
+                continue;
+            }
+            let method_matches = matches!(route.method, MethodOrAny::Any)
+                || matches!(route.method, MethodOrAny::Method(ref route_method) if route_method == method);
+            if !method_matches {
+                continue;
+            }
+            let (handler_id, handler_def) = self.http_handler_full(&route.handler_name)?;
+            return Some((handler_id, handler_def, route));
+        }
+        None
     }
 
     /// The views of the module definition.
@@ -304,14 +655,59 @@ impl ModuleDef {
         self.reducers.get_full(name).map(|(idx, _, def)| (idx.into(), def))
     }
 
-    /// Look up a reducer by its id.
-    pub fn reducer_by_id(&self, id: ReducerId) -> &ReducerDef {
-        &self.reducers[id.idx()]
+    /// Look up a reducer by its wire name, resolving qualified names like `"myauth.verify_token"`.
+    ///
+    /// A plain name searches the consumer's own reducers. A dot-qualified name routes to
+    /// the matching submodule and recurses. Nesting is supported: `"auth.baz.cleanup"`.
+    /// Returns the depth-first `ReducerId` and the `ReducerDef`.
+    pub fn reducer_by_name(&self, name: &str) -> Option<(ReducerId, &ReducerDef)> {
+        self.reducer_by_name_with_module(name).map(|(id, def, _)| (id, def))
     }
 
-    /// Look up a reducer by its id.
+    /// Like `reducer_by_name` but also returns the `ModuleDef` that owns the reducer.
+    /// Use the returned `ModuleDef` (not `self`) when calling `arg_seed_for`, so that
+    /// type-index references in the `ReducerDef` are resolved against the correct typespace.
+    pub fn reducer_by_name_with_module<'a>(&'a self, name: &str) -> Option<(ReducerId, &'a ReducerDef, &'a ModuleDef)> {
+        match name.split_once('.') {
+            None => self
+                .reducers
+                .get_full(name)
+                .map(|(idx, _, def)| (idx.into(), def, self)),
+            Some((namespace, rest)) => {
+                let mut offset = self.reducers.len();
+                for (ns, submodule) in &self.submodules {
+                    if ns == namespace {
+                        let (inner_id, def, owning) = submodule.reducer_by_name_with_module(rest)?;
+                        return Some(((offset + inner_id.idx()).into(), def, owning));
+                    }
+                    offset += submodule.reducer_count();
+                }
+                None
+            }
+        }
+    }
+
+    /// Look up a reducer by its depth-first id.
+    pub fn reducer_by_id(&self, id: ReducerId) -> &ReducerDef {
+        self.get_reducer_by_id(id)
+            .unwrap_or_else(|| panic!("reducer id {id:?} out of range"))
+    }
+
+    /// Look up a reducer by its depth-first id, returning `None` if it doesn't exist.
     pub fn get_reducer_by_id(&self, id: ReducerId) -> Option<&ReducerDef> {
-        self.reducers.get_index(id.idx()).map(|(_, def)| def)
+        let idx = id.idx();
+        if idx < self.reducers.len() {
+            return self.reducers.get_index(idx).map(|(_, def)| def);
+        }
+        let mut offset = self.reducers.len();
+        for submodule in self.submodules.values() {
+            let count = submodule.reducer_count();
+            if idx < offset + count {
+                return submodule.get_reducer_by_id(ReducerId::from(idx - offset));
+            }
+            offset += count;
+        }
+        None
     }
 
     /// Look up a view by its id, and whether it is anonymous.
@@ -320,6 +716,139 @@ impl ModuleDef {
             .iter()
             .find(|(_, def)| def.fn_ptr == id && def.is_anonymous == is_anonymous)
             .map(|(_, def)| def)
+    }
+
+    /// Look up a view by its globally-unique fn_ptr (the offset-adjusted id used by the WASM dispatch layer).
+    /// Returns the `ViewDef` and the owning `ModuleDef`.
+    pub fn get_view_by_global_id_with_module(
+        &self,
+        global_id: ViewFnPtr,
+        is_anonymous: bool,
+    ) -> Option<(&ViewDef, &ModuleDef)> {
+        self.get_view_by_global_id_inner(global_id.0, is_anonymous, 0, 0)
+    }
+
+    fn get_view_by_global_id_inner(
+        &self,
+        global_id: u32,
+        is_anonymous: bool,
+        anon_offset: u32,
+        non_anon_offset: u32,
+    ) -> Option<(&ViewDef, &ModuleDef)> {
+        let local_count = if is_anonymous {
+            self.anon_view_count() as u32
+        } else {
+            self.non_anon_view_count() as u32
+        };
+        let offset = if is_anonymous { anon_offset } else { non_anon_offset };
+        if global_id < offset + local_count {
+            return self
+                .views
+                .values()
+                .find(|def| def.fn_ptr.0 + offset == global_id && def.is_anonymous == is_anonymous)
+                .map(|def| (def, self));
+        }
+        let mut anon_off = anon_offset + self.anon_view_count() as u32;
+        let mut non_anon_off = non_anon_offset + self.non_anon_view_count() as u32;
+        for submodule in self.submodules.values() {
+            let submodule_anon = submodule.total_anon_view_count() as u32;
+            let submodule_non_anon = submodule.total_non_anon_view_count() as u32;
+            let submodule_count = if is_anonymous {
+                submodule_anon
+            } else {
+                submodule_non_anon
+            };
+            let submodule_off = if is_anonymous { anon_off } else { non_anon_off };
+            if global_id < submodule_off + submodule_count {
+                return submodule.get_view_by_global_id_inner(global_id, is_anonymous, anon_off, non_anon_off);
+            }
+            anon_off += submodule_anon;
+            non_anon_off += submodule_non_anon;
+        }
+        None
+    }
+
+    /// Look up a view by its wire name, resolving dot-qualified names like `"lib.library_view"`.
+    ///
+    /// A plain name searches this module's own views. A dot-qualified name routes to
+    /// the matching submodule and recurses. Returns the `ViewDef` and the owning `ModuleDef`.
+    pub fn view_by_name_with_module<'a>(&'a self, name: &str) -> Option<(&'a ViewDef, &'a ModuleDef)> {
+        match name.split_once('.') {
+            None => self.views.get(name).map(|def| (def, self)),
+            Some((namespace, rest)) => {
+                let submodule = self.submodules.get(namespace)?;
+                submodule.view_by_name_with_module(rest)
+            }
+        }
+    }
+
+    /// Like [`view_by_name_with_module`] but also returns the globally-unique `ViewFnPtr`
+    /// that the WASM dispatch layer expects (offset by all anon/non-anon views that precede
+    /// this one in depth-first module order).
+    pub fn view_by_name_with_global_fn_ptr<'a>(
+        &'a self,
+        name: &NamespacedIdentifier,
+    ) -> Option<(ViewFnPtr, &'a ViewDef, &'a ModuleDef)> {
+        let anon_offset = 0u32;
+        let non_anon_offset = 0u32;
+        self.view_by_name_with_global_fn_ptr_inner(name, anon_offset, non_anon_offset)
+    }
+
+    fn view_by_name_with_global_fn_ptr_inner<'a>(
+        &'a self,
+        name: &str,
+        anon_offset: u32,
+        non_anon_offset: u32,
+    ) -> Option<(ViewFnPtr, &'a ViewDef, &'a ModuleDef)> {
+        match name.split_once('.') {
+            None => {
+                let def = self.views.get(name)?;
+                let offset = if def.is_anonymous { anon_offset } else { non_anon_offset };
+                Some((ViewFnPtr(def.fn_ptr.0 + offset), def, self))
+            }
+            Some((namespace, rest)) => {
+                let mut anon_off = anon_offset + self.anon_view_count() as u32;
+                let mut non_anon_off = non_anon_offset + self.non_anon_view_count() as u32;
+                for (ns, submodule) in &self.submodules {
+                    if ns == namespace {
+                        return submodule.view_by_name_with_global_fn_ptr_inner(rest, anon_off, non_anon_off);
+                    }
+                    anon_off += submodule.total_anon_view_count() as u32;
+                    non_anon_off += submodule.total_non_anon_view_count() as u32;
+                }
+                None
+            }
+        }
+    }
+
+    /// Count of anonymous views in this module (not including submodules).
+    pub fn anon_view_count(&self) -> usize {
+        self.views.values().filter(|v| v.is_anonymous).count()
+    }
+
+    /// Count of non-anonymous views in this module (not including submodules).
+    pub fn non_anon_view_count(&self) -> usize {
+        self.views.values().filter(|v| !v.is_anonymous).count()
+    }
+
+    /// Total anonymous view count including all submodules (depth-first sum).
+    pub fn total_anon_view_count(&self) -> usize {
+        self.anon_view_count()
+            + self
+                .submodules
+                .values()
+                .map(|m| m.total_anon_view_count())
+                .sum::<usize>()
+    }
+
+    /// Total non-anonymous view count including all submodules (depth-first sum).
+    pub fn total_non_anon_view_count(&self) -> usize {
+        self.non_anon_view_count()
+            + self
+                .submodules
+                .values()
+                .map(|m| m.total_non_anon_view_count())
+                .sum::<usize>()
     }
 
     /// Convenience method to look up a procedure, possibly by a string.
@@ -339,17 +868,85 @@ impl ModuleDef {
 
     /// Look up a procuedure by its id, panicking if it doesn't exist.
     pub fn procedure_by_id(&self, id: ProcedureId) -> &ProcedureDef {
-        &self.procedures[id.idx()]
+        self.get_procedure_by_id(id)
+            .unwrap_or_else(|| panic!("procedure id {id:?} out of range"))
     }
 
     /// Look up a procuedure by its id, returning `None` if it doesn't exist.
     pub fn get_procedure_by_id(&self, id: ProcedureId) -> Option<&ProcedureDef> {
-        self.procedures.get_index(id.idx()).map(|(_, def)| def)
+        self.get_procedure_by_id_with_module(id).map(|(_, def, _)| def)
+    }
+
+    /// Resolve a flattened wire ID to its host-qualified name, definition and
+    /// owning module. Procedure definitions store local names and type refs.
+    pub fn get_procedure_by_id_with_module(
+        &self,
+        id: ProcedureId,
+    ) -> Option<(NamespacedIdentifier, &ProcedureDef, &ModuleDef)> {
+        let idx = id.idx();
+        if idx < self.procedures.len() {
+            return self
+                .procedures
+                .get_index(idx)
+                .map(|(_, def)| (self.path.join(def.name.clone()), def, self));
+        }
+        let mut offset = self.procedures.len();
+        for submodule in self.submodules.values() {
+            let count = submodule.procedure_count();
+            if idx < offset + count {
+                return submodule.get_procedure_by_id_with_module(ProcedureId::from(idx - offset));
+            }
+            offset += count;
+        }
+        None
+    }
+
+    /// Total procedure count including all submodules (depth-first sum).
+    pub fn procedure_count(&self) -> usize {
+        self.procedures.len() + self.submodules.values().map(|m| m.procedure_count()).sum::<usize>()
+    }
+
+    /// Look up a procedure by its wire name, resolving qualified names like `"mylib.proc_name"`.
+    ///
+    /// A plain name searches the module's own procedures. A dot-qualified name routes to
+    /// the matching submodule and recurses. Returns the depth-first `ProcedureId` and the `ProcedureDef`.
+    pub fn procedure_by_name(&self, name: &str) -> Option<(ProcedureId, &ProcedureDef)> {
+        self.procedure_by_name_with_module(name).map(|(id, def, _)| (id, def))
+    }
+
+    /// Like `procedure_by_name` but also returns the `ModuleDef` that owns the procedure.
+    /// Use the returned `ModuleDef` (not `self`) when calling `arg_seed_for`.
+    pub fn procedure_by_name_with_module<'a>(
+        &'a self,
+        name: &str,
+    ) -> Option<(ProcedureId, &'a ProcedureDef, &'a ModuleDef)> {
+        match name.split_once('.') {
+            None => self
+                .procedures
+                .get_full(name)
+                .map(|(idx, _, def)| (idx.into(), def, self)),
+            Some((namespace, rest)) => {
+                let mut offset = self.procedures.len();
+                for (ns, submodule) in &self.submodules {
+                    if ns == namespace {
+                        let (inner_id, def, owning) = submodule.procedure_by_name_with_module(rest)?;
+                        return Some(((offset + inner_id.idx()).into(), def, owning));
+                    }
+                    offset += submodule.procedure_count();
+                }
+                None
+            }
+        }
     }
 
     /// Looks up a lifecycle reducer defined in the module.
     pub fn lifecycle_reducer(&self, lifecycle: Lifecycle) -> Option<(ReducerId, &ReducerDef)> {
         self.lifecycle_reducers[lifecycle].map(|i| (i, &self.reducers[i.idx()]))
+    }
+
+    /// All lifecycle reducer assignments for this module (does not include submodules).
+    pub fn lifecycle_reducers_map(&self) -> &EnumMap<Lifecycle, Option<ReducerId>> {
+        &self.lifecycle_reducers
     }
 
     /// Returns a `DeserializeSeed` that can pull data from a `Deserializer` for `def`.
@@ -430,9 +1027,13 @@ impl TryFrom<raw_def::v9::RawModuleDefV9> for ModuleDef {
         validate::v9::validate(v9_mod)
     }
 }
+/// Note: this conversion is lossy for modules with submodules. `RawModuleDefV9` has no
+/// submodule representation, so submodules (and everything defined in them) are dropped.
+/// Callers serving V9 to old clients should be aware those clients see a partial module.
 impl From<ModuleDef> for RawModuleDefV9 {
     fn from(val: ModuleDef) -> Self {
         let ModuleDef {
+            path: _,
             tables,
             views,
             reducers,
@@ -444,8 +1045,12 @@ impl From<ModuleDef> for RawModuleDefV9 {
             refmap: _,
             row_level_security_raw,
             procedures,
+            http_handlers: _,
+            http_routes: _,
             raw_module_def_version: _,
-            mounts: _,
+            submodules: _,
+            accessor_path: _,
+            environment: _,
         } = val;
 
         // Extract column defaults from tables before consuming tables
@@ -490,6 +1095,7 @@ impl TryFrom<raw_def::v10::RawModuleDefV10> for ModuleDef {
 impl From<ModuleDef> for RawModuleDefV10 {
     fn from(val: ModuleDef) -> Self {
         let ModuleDef {
+            path: _,
             tables,
             views,
             reducers,
@@ -501,11 +1107,24 @@ impl From<ModuleDef> for RawModuleDefV10 {
             refmap: _,
             row_level_security_raw,
             procedures,
+            http_handlers,
+            http_routes,
             raw_module_def_version: _,
-            mounts,
+            submodules,
+            accessor_path: _,
+            environment,
         } = val;
 
-        let mut sections = Vec::new();
+        // Names are already canonicalized. Disable further case conversion so revalidation
+        // preserves them.
+        let mut sections = vec![RawModuleDefV10Section::CaseConversionPolicy(
+            raw_def::v10::CaseConversionPolicy::None,
+        )];
+        if let Some(environment) = environment {
+            sections.push(RawModuleDefV10Section::Environment(
+                environment.into_declarations().into_iter().map(|x| x.into()).collect(),
+            ));
+        }
         let mut explicit_names = ExplicitNames::default();
 
         sections.push(RawModuleDefV10Section::Typespace(typespace));
@@ -528,9 +1147,10 @@ impl From<ModuleDef> for RawModuleDefV10 {
             sections.push(RawModuleDefV10Section::Types(raw_types));
         }
 
-        // Collect schedules from tables (V10 stores them in a separate section).
+        // Collect schedules and outboxes from tables (V10 stores them in separate sections).
         // Also collect ExplicitNames for tables: accessor_name → source_name, name → canonical_name.
         let mut schedules = Vec::new();
+        let mut outboxes = Vec::new();
         let raw_tables: Vec<RawTableDefV10> = tables
             .into_values()
             .map(|td| {
@@ -547,6 +1167,18 @@ impl From<ModuleDef> for RawModuleDefV10 {
                         function_name: sched.function_name.into(),
                     });
                 }
+                if let Some(outbox) = td.outbox.clone() {
+                    outboxes.push(RawOutboxDefV10 {
+                        table_name: td.accessor_name.clone().into(),
+                        remote_reducer: outbox.remote_reducer.into(),
+                        target_column: outbox.target_column,
+                        arg_columns: outbox.arg_columns,
+                        on_result_reducer: outbox
+                            .on_result_reducer
+                            .map(|name| reducers[name.local()].accessor_name.clone().into()),
+                        signature_hash: outbox.signature_hash,
+                    });
+                }
                 td.into()
             })
             .collect();
@@ -555,12 +1187,13 @@ impl From<ModuleDef> for RawModuleDefV10 {
         }
 
         // Collect ExplicitNames for reducers: accessor_name → source_name, name → canonical_name.
+        // local name so re-validating this raw def doesn't reject dotted identifiers.
         let raw_reducers: Vec<RawReducerDefV10> = reducers
             .into_values()
             .map(|rd| {
                 explicit_names.insert_function(
                     RawIdentifier::from(rd.accessor_name.clone()),
-                    RawIdentifier::from(rd.name.clone()),
+                    RawIdentifier::from(rd.name.local().clone()),
                 );
                 rd.into()
             })
@@ -584,7 +1217,35 @@ impl From<ModuleDef> for RawModuleDefV10 {
             sections.push(RawModuleDefV10Section::Procedures(raw_procedures));
         }
 
+        let raw_http_routes: Vec<RawHttpRouteDefV10> = http_routes
+            .into_iter()
+            .map(|route| RawHttpRouteDefV10 {
+                handler_function: http_handlers[&route.handler_name].accessor_name.clone().into(),
+                ..route.into()
+            })
+            .collect();
+        let raw_http_handlers: Vec<RawHttpHandlerDefV10> = http_handlers
+            .into_values()
+            .map(|hd| {
+                explicit_names.insert_function(
+                    RawIdentifier::from(hd.accessor_name.clone()),
+                    RawIdentifier::from(hd.name.clone()),
+                );
+                RawHttpHandlerDefV10 {
+                    source_name: hd.accessor_name.into(),
+                }
+            })
+            .collect();
+        if !raw_http_handlers.is_empty() {
+            sections.push(RawModuleDefV10Section::HttpHandlers(raw_http_handlers));
+        }
+
+        if !raw_http_routes.is_empty() {
+            sections.push(RawModuleDefV10Section::HttpRoutes(raw_http_routes));
+        }
+
         // Collect ExplicitNames for views: accessor_name → source_name, name → canonical_name.
+        let mut raw_view_primary_keys = Vec::new();
         let raw_views: Vec<RawViewDefV10> = views
             .into_values()
             .map(|vd| {
@@ -592,15 +1253,42 @@ impl From<ModuleDef> for RawModuleDefV10 {
                     RawIdentifier::from(vd.accessor_name.clone()),
                     RawIdentifier::from(vd.name.clone()),
                 );
+                // Only explicit procedural-view primary keys are serialized into
+                // `ViewPrimaryKeys`. Primary keys for query builder views are
+                // inferred again during validation from the returned table type.
+                if vd.is_procedural()
+                    && let Some(primary_key) = vd.primary_key
+                    && let Some(column) = vd.return_columns.get(primary_key.idx())
+                {
+                    raw_view_primary_keys.push(RawViewPrimaryKeyDefV10 {
+                        view_source_name: RawIdentifier::from(vd.accessor_name.clone()),
+                        // Use the already canonicalized column name, because this raw
+                        // module def is being emitted from an already canonicalized
+                        // `ModuleDef`. The `Typespace` section we emit below contains
+                        // those canonical column names, and V10 has no column-level
+                        // `ExplicitNames` section to translate source column names
+                        // during the next validation pass. Therefore the serialized
+                        // primary-key column must match the canonical name present in
+                        // the emitted return type.
+                        columns: vec![RawIdentifier::from(column.name.clone())],
+                    });
+                }
                 vd.into()
             })
             .collect();
         if !raw_views.is_empty() {
             sections.push(RawModuleDefV10Section::Views(raw_views));
         }
+        if !raw_view_primary_keys.is_empty() {
+            sections.push(RawModuleDefV10Section::ViewPrimaryKeys(raw_view_primary_keys));
+        }
 
         if !schedules.is_empty() {
             sections.push(RawModuleDefV10Section::Schedules(schedules));
+        }
+
+        if !outboxes.is_empty() {
+            sections.push(RawModuleDefV10Section::Outboxes(outboxes));
         }
 
         if !raw_lifecycle.is_empty() {
@@ -612,19 +1300,23 @@ impl From<ModuleDef> for RawModuleDefV10 {
             sections.push(RawModuleDefV10Section::RowLevelSecurity(raw_rls));
         }
 
-        // Always emit ExplicitNames so canonical names survive the round-trip.
-        sections.push(RawModuleDefV10Section::ExplicitNames(explicit_names));
-
-        let mounts: Vec<_> = mounts
+        let submodules: Vec<_> = submodules
             .into_iter()
-            .map(|(namespace, module)| RawModuleMountV10 {
-                namespace,
-                module: module.into(),
+            .map(|(namespace, module)| {
+                let accessor = module.mount_accessor_name().unwrap_or(&namespace).to_string();
+                explicit_names.insert_namespace(accessor.clone(), namespace);
+                RawSubmoduleV10 {
+                    namespace: accessor,
+                    module: module.into(),
+                }
             })
             .collect();
-        if !mounts.is_empty() {
-            sections.push(RawModuleDefV10Section::Mounts(mounts));
+        if !submodules.is_empty() {
+            sections.push(RawModuleDefV10Section::Submodules(submodules));
         }
+
+        // Always emit ExplicitNames so canonical names survive the round-trip.
+        sections.push(RawModuleDefV10Section::ExplicitNames(explicit_names));
 
         RawModuleDefV10 { sections }
     }
@@ -664,6 +1356,14 @@ pub struct TableDef {
     /// Unique within a module, acts as the table's identifier.
     /// Must be a valid [crate::db::identifier::Identifier].
     pub name: Identifier,
+
+    /// The namespace path this table's module is mounted under, empty for the root.
+    ///
+    /// Together with `name` this forms the table's [`ModuleDefLookup`] key. Storing the
+    /// path rather than a pre-joined qualified name keeps the local name un-duplicated;
+    /// the joined form is built at the few places that need it (see
+    /// [`NamespacePath::join`]). Maintained by [`ModuleDef::apply_namespace`].
+    pub namespace: NamespacePath,
     /// The table identifier as defined in the module source.
     ///
     /// All the codegens should use `accessor_name` to derive the table identifier for clients.
@@ -713,6 +1413,24 @@ pub struct TableDef {
     /// Event tables persist to the commitlog but are not merged into committed state.
     /// Their rows are only visible to V2 subscribers in the transaction that inserted them.
     pub is_event: bool,
+
+    /// IDC outbox configuration, if this table sends remote reducer calls.
+    pub outbox: Option<OutboxDef>,
+}
+
+/// Configuration for an IDC outbox table.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct OutboxDef {
+    /// The reducer to invoke on the target database.
+    pub remote_reducer: ReducerName,
+    /// Column containing the receiver database identity.
+    pub target_column: ColId,
+    /// Columns to encode as reducer arguments, in receiver parameter order.
+    pub arg_columns: Vec<ColId>,
+    /// Local reducer to invoke with the remote result before acknowledging this stream.
+    pub on_result_reducer: Option<ReducerName>,
+    /// Hash of the receiver reducer signature as seen by sender bindings.
+    pub signature_hash: SpacetimeHash,
 }
 
 impl TableDef {
@@ -739,7 +1457,6 @@ impl From<TableDef> for RawTableDefV9 {
             schedule,
             table_type,
             table_access,
-            is_event: _, // V9 does not support event tables; ignore when converting back
             ..
         } = val;
 
@@ -761,9 +1478,10 @@ impl From<TableDef> for RawTableDefV10 {
     fn from(val: TableDef) -> Self {
         let TableDef {
             name: _,
+            namespace: _,
             product_type_ref,
             primary_key,
-            columns: _, // will be reconstructed from the product type.
+            columns, // names/types are reconstructed from the product type; only defaults are read here.
             indexes,
             constraints,
             sequences,
@@ -772,6 +1490,7 @@ impl From<TableDef> for RawTableDefV10 {
             table_access,
             is_event,
             accessor_name,
+            outbox: _, // V10 stores outboxes in a separate section; handled in From<ModuleDef>.
         } = val;
 
         RawTableDefV10 {
@@ -783,7 +1502,16 @@ impl From<TableDef> for RawTableDefV10 {
             sequences: sequences.into_values().map(Into::into).collect(),
             table_type,
             table_access,
-            default_values: Vec::new(),
+            default_values: columns
+                .iter()
+                .filter_map(|col| {
+                    let default_value = col.default_value.as_ref()?;
+                    Some(RawColumnDefaultValueV10 {
+                        col_id: col.col_id,
+                        value: spacetimedb_sats::bsatn::to_vec(default_value).unwrap().into(),
+                    })
+                })
+                .collect(),
             is_event,
         }
     }
@@ -802,6 +1530,7 @@ impl From<ViewDef> for TableDef {
             ..
         } = def;
         Self {
+            namespace: NamespacePath::root(),
             name,
             product_type_ref,
             primary_key,
@@ -814,37 +1543,42 @@ impl From<ViewDef> for TableDef {
             table_access: if is_public { Public } else { Private },
             is_event: false,
             accessor_name,
+            outbox: None,
         }
     }
 }
 
 /// A sequence definition for a database table column.
+///
+/// Previous versions of this definition exposed options `start`, `min_value`, `max_value` and `increment`.
+/// SpacetimeDB never exercised these options in any useful way,
+/// and supporting them caused considerable implementation burden,
+/// so we chose to remove them.
+/// All sequences start at some arbitrary nonnegative value near zero,
+/// have the range of the non-negative `i128`s,
+/// and increment by 1.
+/// Raw defs still have these values, but we reject any def that uses values other than the defaults.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct SequenceDef {
     /// The name of the sequence. Must be unique within the containing `ModuleDef`.
     pub name: RawIdentifier,
+
+    /// The namespace path this sequence's module is mounted under.
+    ///
+    /// Together with `name` this forms the sequence's [`ModuleDefLookup`] key. A pair is used
+    /// rather than a dotted name because `name` is not guaranteed to be dot-free.
+    pub namespace: NamespacePath,
 
     /// The position of the column associated with this sequence.
     /// This refers to a column in the same `RawTableDef` that contains this `RawSequenceDef`.
     /// The column must have integral type.
     /// This must be the unique `RawSequenceDef` for this column.
     pub column: ColId,
+}
 
-    /// The value to start assigning to this column.
-    /// Will be incremented by 1 for each new row.
-    /// If not present, an arbitrary start point may be selected.
-    pub start: Option<i128>,
-
-    /// The minimum allowed value in this column.
-    /// If not present, no minimum.
-    pub min_value: Option<i128>,
-
-    /// The maximum allowed value in this column.
-    /// If not present, no maximum.
-    pub max_value: Option<i128>,
-
-    /// The increment to use when updating the sequence.
-    pub increment: i128,
+impl SequenceDef {
+    /// All sequences increment by 1.
+    pub const INCREMENT: i128 = 1;
 }
 
 impl From<SequenceDef> for RawSequenceDefV9 {
@@ -852,10 +1586,10 @@ impl From<SequenceDef> for RawSequenceDefV9 {
         RawSequenceDefV9 {
             name: Some(val.name),
             column: val.column,
-            start: val.start,
-            min_value: val.min_value,
-            max_value: val.max_value,
-            increment: val.increment,
+            start: None,
+            min_value: None,
+            max_value: None,
+            increment: SequenceDef::INCREMENT,
         }
     }
 }
@@ -865,10 +1599,10 @@ impl From<SequenceDef> for RawSequenceDefV10 {
         RawSequenceDefV10 {
             source_name: Some(val.name),
             column: val.column,
-            start: val.start,
-            min_value: val.min_value,
-            max_value: val.max_value,
-            increment: val.increment,
+            start: None,
+            min_value: None,
+            max_value: None,
+            increment: SequenceDef::INCREMENT,
         }
     }
 }
@@ -886,6 +1620,12 @@ pub struct IndexDef {
     /// in V10, this can be optionally passed in by the user, but if not passed in, it will be
     /// generated by the system using the same algorithm as V9 and earlier.
     pub name: RawIdentifier,
+
+    /// The namespace path this index's module is mounted under.
+    ///
+    /// Together with `name` this forms the index's [`ModuleDefLookup`] key. A pair is used
+    /// rather than a dotted name because `name` is not guaranteed to be dot-free.
+    pub namespace: NamespacePath,
 
     /// This will be the same as `name` for [`RawModuleDefV9`].
     /// For [`RawModuleDefV10`], this is an auto-generated globally unique name
@@ -1196,6 +1936,12 @@ pub struct ConstraintDef {
     /// The name of the constraint. Unique within the containing `ModuleDef`.
     pub name: RawIdentifier,
 
+    /// The namespace path this constraint's module is mounted under.
+    ///
+    /// Together with `name` this forms the constraint's [`ModuleDefLookup`] key. A pair is used
+    /// rather than a dotted name because `name` is not guaranteed to be dot-free.
+    pub namespace: NamespacePath,
+
     /// The data for the constraint.
     pub data: ConstraintData,
 }
@@ -1322,6 +2068,10 @@ impl fmt::Display for FunctionKind {
 pub struct ScheduleDef {
     /// The name of the schedule. Must be unique within the containing `ModuleDef`.
     pub name: Identifier,
+
+    /// The namespace path this schedule's module is mounted under.
+    /// See [`TableDef::namespace`].
+    pub namespace: NamespacePath,
 
     /// The name of the column that stores the desired invocation time.
     ///
@@ -1497,6 +2247,10 @@ pub struct ViewDef {
     /// The name of the view. This must be unique within the module.
     pub name: Identifier,
 
+    /// The namespace path this view's module is mounted under.
+    /// See [`TableDef::namespace`].
+    pub namespace: NamespacePath,
+
     /// The view identifier as defined in the module source.
     ///
     /// Similar to `[TableDef.accessor_name]`.
@@ -1575,6 +2329,12 @@ impl ViewDef {
     pub fn get_param_by_name(&self, name: &Identifier) -> Option<&ViewParamDef> {
         self.param_columns.iter().find(|c| &c.name == name)
     }
+
+    /// Is this a procedural view or query builder view?
+    pub fn is_procedural(&self) -> bool {
+        use extract_view_return_product_type_ref as extract_kind;
+        matches!(extract_kind(&self.return_type), Some((_, ViewKind::Procedural)))
+    }
 }
 
 impl From<ViewDef> for RawViewDefV9 {
@@ -1606,6 +2366,7 @@ impl From<ViewDef> for RawViewDefV10 {
             is_anonymous,
             is_public,
             params,
+            params_for_generate,
             return_type,
             fn_ptr,
             ..
@@ -1615,7 +2376,7 @@ impl From<ViewDef> for RawViewDefV10 {
             index: fn_ptr.into(),
             is_public,
             is_anonymous,
-            params,
+            params: canonical_params(params, &params_for_generate),
             return_type,
         }
     }
@@ -1669,7 +2430,8 @@ impl From<FunctionVisibility> for RawFunctionVisibility {
 #[derive(Debug, Clone, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct ReducerDef {
-    /// The name of the reducer. This must be unique within the module's set of reducers and procedures.
+    /// The name of the reducer. This must be unique within the module's set of reducers and
+    /// procedures. Qualified by the namespace the module is mounted under; see [`ReducerName`].
     pub name: ReducerName,
 
     /// The reducer name as defined in the module source.
@@ -1703,6 +2465,94 @@ pub struct ReducerDef {
     pub err_return_type: AlgebraicType,
 }
 
+impl ReducerDef {
+    /// Parameter types with schema names.
+    pub fn params(&self) -> ProductType {
+        canonical_params(self.params.clone(), &self.params_for_generate)
+    }
+}
+
+// Keep the original typespace references, but use the names resolved by validation so
+// revalidating the raw definition with CaseConversionPolicy::None preserves the schema.
+fn canonical_params(mut params: ProductType, params_for_generate: &ProductTypeDef) -> ProductType {
+    assert_eq!(params.elements.len(), params_for_generate.elements.len());
+    for (param, (name, _)) in params.elements.iter_mut().zip(params_for_generate.elements.iter()) {
+        param.name = Some(name.clone().into());
+    }
+    params
+}
+
+const REDUCER_SIGNATURE_HASH_DOMAIN: &[u8] = b"spacetimedb:idc:reducer-signature:v1\0";
+
+/// Computes the IDC signature hash from parameter names, order, types, and both return types.
+///
+/// The encoding is the versioned domain prefix followed by BSATN
+/// `(AlgebraicType::Product(params), ok_return_type, err_return_type, reducer_typespace)`,
+/// hashed with Keccak-256. Reducer Typespace are a `Vec<AlgebraicType>` in first-use order,
+/// traversing parameters, then the success type, then the error type, kind of reducer local
+/// typespace.
+pub fn reducer_signature_hash(
+    params: &ProductType,
+    ok_return_type: &AlgebraicType,
+    err_return_type: &AlgebraicType,
+    typespace: &Typespace,
+) -> spacetimedb_lib::Hash {
+    fn normalize(
+        ty: &mut AlgebraicType,
+        typespace: &Typespace,
+        refs: &mut BTreeMap<AlgebraicTypeRef, AlgebraicTypeRef>,
+        reducer_typespace: &mut Typespace,
+    ) {
+        match ty {
+            AlgebraicType::Ref(original) => {
+                // Number reachable types in first-use order so unrelated types and
+                // their positions in the module's typespace do not affect the hash.
+                let local_idx = if let Some(local_idx) = refs.get(original) {
+                    *local_idx
+                } else {
+                    // Reserve the id before following references so recursive types
+                    // can refer back to this definition while it is being copied.
+                    let local_idx = reducer_typespace.add(AlgebraicType::unit());
+                    refs.insert(*original, local_idx);
+                    let mut definition = typespace[*original].clone();
+                    normalize(&mut definition, typespace, refs, reducer_typespace);
+                    reducer_typespace[local_idx] = definition;
+                    local_idx
+                };
+                *original = local_idx;
+            }
+            AlgebraicType::Product(product) => {
+                for field in &mut product.elements {
+                    normalize(&mut field.algebraic_type, typespace, refs, reducer_typespace);
+                }
+            }
+            AlgebraicType::Sum(sum) => {
+                for variant in &mut sum.variants {
+                    normalize(&mut variant.algebraic_type, typespace, refs, reducer_typespace);
+                }
+            }
+            AlgebraicType::Array(array) => normalize(&mut array.elem_ty, typespace, refs, reducer_typespace),
+            _ => {}
+        }
+    }
+
+    let mut params = AlgebraicType::Product(params.clone());
+    let mut ok_return_type = ok_return_type.clone();
+    let mut err_return_type = err_return_type.clone();
+    let mut refs = BTreeMap::new();
+    let mut reducer_typespace = Typespace::default();
+    for ty in [&mut params, &mut ok_return_type, &mut err_return_type] {
+        normalize(ty, typespace, &mut refs, &mut reducer_typespace);
+    }
+    let mut bytes = REDUCER_SIGNATURE_HASH_DOMAIN.to_vec();
+    bsatn::to_writer(
+        &mut bytes,
+        &(params, ok_return_type, err_return_type, reducer_typespace.types),
+    )
+    .expect("validated signature should serialize");
+    hash_bytes(&bytes)
+}
+
 impl From<ReducerDef> for RawReducerDefV9 {
     fn from(val: ReducerDef) -> Self {
         RawReducerDefV9 {
@@ -1717,7 +2567,7 @@ impl From<ReducerDef> for RawReducerDefV10 {
     fn from(val: ReducerDef) -> Self {
         RawReducerDefV10 {
             source_name: val.accessor_name.into(),
-            params: val.params,
+            params: canonical_params(val.params, &val.params_for_generate),
             visibility: val.visibility.into(),
             ok_return_type: val.ok_return_type,
             err_return_type: val.err_return_type,
@@ -1763,6 +2613,34 @@ pub struct ProcedureDef {
     pub visibility: FunctionVisibility,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct HttpHandlerDef {
+    /// The canonical name of the handler.
+    pub name: Identifier,
+
+    /// The handler name as defined in the module source.
+    pub accessor_name: Identifier,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct HttpRouteDef {
+    pub handler_name: Identifier,
+    pub method: spacetimedb_lib::db::raw_def::v10::MethodOrAny,
+    pub path: Box<str>,
+}
+
+impl From<HttpRouteDef> for RawHttpRouteDefV10 {
+    fn from(val: HttpRouteDef) -> Self {
+        RawHttpRouteDefV10 {
+            handler_function: val.handler_name.into(),
+            method: val.method,
+            path: RawIdentifier::new(val.path.as_ref()),
+        }
+    }
+}
+
 impl From<ProcedureDef> for RawProcedureDefV9 {
     fn from(val: ProcedureDef) -> Self {
         RawProcedureDefV9 {
@@ -1777,7 +2655,7 @@ impl From<ProcedureDef> for RawProcedureDefV10 {
     fn from(val: ProcedureDef) -> Self {
         RawProcedureDefV10 {
             source_name: val.accessor_name.into(),
-            params: val.params,
+            params: canonical_params(val.params, &val.params_for_generate),
             return_type: val.return_type,
             visibility: val.visibility.into(),
         }
@@ -1791,38 +2669,43 @@ impl From<ProcedureDef> for RawMiscModuleExportV9 {
 }
 
 impl ModuleDefLookup for TableDef {
-    type Key<'a> = &'a Identifier;
+    // (namespace, name). See [`TableDef::namespace`].
+    type Key<'a> = (&'a NamespacePath, &'a Identifier);
 
     fn key(&self) -> Self::Key<'_> {
-        &self.name
+        (&self.namespace, &self.name)
     }
 
-    fn lookup<'a>(module_def: &'a ModuleDef, key: Self::Key<'_>) -> Option<&'a Self> {
-        module_def.tables.get(key)
+    fn lookup<'a>(module_def: &'a ModuleDef, (namespace, name): Self::Key<'_>) -> Option<&'a Self> {
+        module_def.resolve_path(namespace)?.tables.get(name)
     }
 }
 
 impl ModuleDefLookup for SequenceDef {
-    type Key<'a> = &'a RawIdentifier;
+    // (namespace, name). See [`SequenceDef::namespace`].
+    type Key<'a> = (&'a NamespacePath, &'a RawIdentifier);
 
     fn key(&self) -> Self::Key<'_> {
-        &self.name
+        (&self.namespace, &self.name)
     }
 
-    fn lookup<'a>(module_def: &'a ModuleDef, key: Self::Key<'_>) -> Option<&'a Self> {
-        module_def.stored_in_table_def(key)?.sequences.get(key)
+    fn lookup<'a>(module_def: &'a ModuleDef, (namespace, name): Self::Key<'_>) -> Option<&'a Self> {
+        let owning = module_def.resolve_path(namespace)?;
+        owning.stored_in_table_def(name)?.sequences.get(name)
     }
 }
 
 impl ModuleDefLookup for IndexDef {
-    type Key<'a> = &'a RawIdentifier;
+    // (namespace, name). See [`IndexDef::namespace`].
+    type Key<'a> = (&'a NamespacePath, &'a RawIdentifier);
 
     fn key(&self) -> Self::Key<'_> {
-        &self.name
+        (&self.namespace, &self.name)
     }
 
-    fn lookup<'a>(module_def: &'a ModuleDef, key: Self::Key<'_>) -> Option<&'a Self> {
-        module_def.stored_in_table_def(key)?.indexes.get(key)
+    fn lookup<'a>(module_def: &'a ModuleDef, (namespace, name): Self::Key<'_>) -> Option<&'a Self> {
+        let owning = module_def.resolve_path(namespace)?;
+        owning.stored_in_table_def(name)?.indexes.get(name)
     }
 }
 
@@ -1879,14 +2762,16 @@ impl ModuleDefLookup for ViewParamDef {
 }
 
 impl ModuleDefLookup for ConstraintDef {
-    type Key<'a> = &'a RawIdentifier;
+    // (namespace, name). See [`ConstraintDef::namespace`].
+    type Key<'a> = (&'a NamespacePath, &'a RawIdentifier);
 
     fn key(&self) -> Self::Key<'_> {
-        &self.name
+        (&self.namespace, &self.name)
     }
 
-    fn lookup<'a>(module_def: &'a ModuleDef, key: Self::Key<'_>) -> Option<&'a Self> {
-        module_def.stored_in_table_def(key)?.constraints.get(key)
+    fn lookup<'a>(module_def: &'a ModuleDef, (namespace, name): Self::Key<'_>) -> Option<&'a Self> {
+        let owning = module_def.resolve_path(namespace)?;
+        owning.stored_in_table_def(name)?.constraints.get(name)
     }
 }
 
@@ -1903,19 +2788,17 @@ impl ModuleDefLookup for RawRowLevelSecurityDefV9 {
 }
 
 impl ModuleDefLookup for ScheduleDef {
-    type Key<'a> = &'a Identifier;
+    // (namespace, name). See [`ScheduleDef::namespace`].
+    type Key<'a> = (&'a NamespacePath, &'a Identifier);
 
     fn key(&self) -> Self::Key<'_> {
-        &self.name
+        (&self.namespace, &self.name)
     }
 
-    fn lookup<'a>(module_def: &'a ModuleDef, key: Self::Key<'_>) -> Option<&'a Self> {
-        let schedule = module_def.stored_in_table_def(key.as_raw())?.schedule.as_ref()?;
-        if &schedule.name == key {
-            Some(schedule)
-        } else {
-            None
-        }
+    fn lookup<'a>(module_def: &'a ModuleDef, (namespace, name): Self::Key<'_>) -> Option<&'a Self> {
+        let owning = module_def.resolve_path(namespace)?;
+        let schedule = owning.stored_in_table_def(name.as_raw())?.schedule.as_ref()?;
+        (&schedule.name == name).then_some(schedule)
     }
 }
 
@@ -1958,14 +2841,15 @@ impl ModuleDefLookup for ProcedureDef {
 }
 
 impl ModuleDefLookup for ViewDef {
-    type Key<'a> = &'a Identifier;
+    // (namespace, name). See [`TableDef::namespace`].
+    type Key<'a> = (&'a NamespacePath, &'a Identifier);
 
     fn key(&self) -> Self::Key<'_> {
-        &self.name
+        (&self.namespace, &self.name)
     }
 
-    fn lookup<'a>(view_def: &'a ModuleDef, key: Self::Key<'_>) -> Option<&'a Self> {
-        view_def.views.get(key)
+    fn lookup<'a>(module_def: &'a ModuleDef, (namespace, name): Self::Key<'_>) -> Option<&'a Self> {
+        module_def.resolve_path(namespace)?.views.get(name)
     }
 }
 
@@ -2028,6 +2912,191 @@ mod tests {
     }
 
     #[test]
+    fn v10_roundtrip_preserves_reducer_signature_casing() {
+        use spacetimedb_lib::db::raw_def::v10::{CaseConversionPolicy, RawModuleDefV10Builder};
+
+        for policy in [CaseConversionPolicy::None, CaseConversionPolicy::SnakeCase] {
+            let mut builder = RawModuleDefV10Builder::new();
+            builder.set_case_conversion_policy(policy);
+            let item_ref = builder.add_algebraic_type(
+                [],
+                "Message",
+                AlgebraicType::product([("Item", AlgebraicType::U64)]),
+                false,
+            );
+            builder.add_reducer(
+                "receive",
+                ProductType::from([("MessageBody", AlgebraicType::Ref(item_ref))]),
+            );
+            builder.add_procedure(
+                "read_message",
+                ProductType::from([("MessageBody", AlgebraicType::Ref(item_ref))]),
+                AlgebraicType::Ref(item_ref),
+            );
+            builder.add_view(
+                "messages",
+                0,
+                true,
+                true,
+                ProductType::from([("MessageBody", AlgebraicType::Ref(item_ref))]),
+                AlgebraicType::array(AlgebraicType::Ref(item_ref)),
+            );
+            let original: ModuleDef = builder.finish().try_into().expect("valid module");
+            let roundtrip =
+                ModuleDef::try_from(RawModuleDefV10::from(original.clone())).expect("valid roundtripped module");
+            let signature = |module: &ModuleDef| {
+                let (_, reducer) = module.reducer_by_name("receive").expect("receiver exists");
+                reducer_signature_hash(
+                    &reducer.params(),
+                    &reducer.ok_return_type,
+                    &reducer.err_return_type,
+                    module.typespace(),
+                )
+            };
+
+            assert_eq!(original.typespace(), roundtrip.typespace());
+            assert_eq!(signature(&original), signature(&roundtrip));
+            for (original, roundtrip) in original.procedures().zip(roundtrip.procedures()) {
+                assert_eq!(original.params_for_generate, roundtrip.params_for_generate);
+            }
+            for (original, roundtrip) in original.views().zip(roundtrip.views()) {
+                assert_eq!(original.params_for_generate, roundtrip.params_for_generate);
+            }
+        }
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn v10_canonical_params_deserialize_on_receiver() {
+        use spacetimedb_lib::db::raw_def::v10::{CaseConversionPolicy, RawModuleDefV10Builder};
+        use spacetimedb_sats::{de::DeserializeSeed as _, product, WithTypespace};
+
+        #[derive(Debug, PartialEq, spacetimedb_sats::Deserialize)]
+        #[sats(crate = spacetimedb_sats)]
+        struct ReceiverMessage {
+            Item: u64,
+        }
+
+        for policy in [CaseConversionPolicy::None, CaseConversionPolicy::SnakeCase] {
+            let mut builder = RawModuleDefV10Builder::new();
+            builder.set_case_conversion_policy(policy);
+            let item_ref = builder.add_algebraic_type(
+                [],
+                "Message",
+                AlgebraicType::product([("Item", AlgebraicType::U64)]),
+                false,
+            );
+            builder.add_reducer(
+                "receive",
+                ProductType::from([
+                    ("MessageBody", AlgebraicType::Ref(item_ref)),
+                    ("RequestID", AlgebraicType::String),
+                ]),
+            );
+            let original: ModuleDef = builder.finish().try_into().expect("valid module");
+            let roundtrip =
+                ModuleDef::try_from(RawModuleDefV10::from(original.clone())).expect("valid roundtripped module");
+            let (_, sender) = roundtrip.reducer_by_name("receive").unwrap();
+            let (_, receiver) = original.reducer_by_name("receive").unwrap();
+            let expected_names = if matches!(policy, CaseConversionPolicy::None) {
+                ["MessageBody", "RequestID"]
+            } else {
+                ["message_body", "request_id"]
+            };
+            assert_eq!(
+                sender
+                    .params
+                    .elements
+                    .iter()
+                    .map(|param| param.name.as_ref().unwrap().as_ref())
+                    .collect::<Vec<&str>>(),
+                expected_names
+            );
+            assert_eq!(
+                receiver.params.elements[0].name.as_ref().unwrap().as_ref(),
+                "MessageBody"
+            );
+
+            // Encode using the exported canonical schema, as a sender does. Distinct
+            // argument types make an accidental change in parameter order observable.
+            let args = product![product![42u64], "request-7"];
+            let bytes = bsatn::to_vec(&WithTypespace::new(roundtrip.typespace(), &sender.params).with_value(&args))
+                .expect("canonical sender arguments should encode");
+
+            // The host still decodes against the receiver's original parameter names.
+            let mut remaining = bytes.as_slice();
+            let decoded = original
+                .arg_seed_for(receiver)
+                .deserialize(bsatn::Deserializer::new(&mut remaining))
+                .expect("receiver should accept arguments encoded with canonical names");
+            assert_eq!(decoded, args);
+            assert!(remaining.is_empty());
+
+            // A Rust receiver then decodes the same bytes into its source-language
+            // types. BSATN carries values in order, not schema field names.
+            let typed: (ReceiverMessage, String) =
+                bsatn::from_slice(&bytes).expect("Rust receiver should deserialize the original argument types");
+            assert_eq!(typed, (ReceiverMessage { Item: 42 }, "request-7".to_owned()));
+        }
+    }
+
+    #[test]
+    fn v10_roundtrip_preserves_http_handler_names() {
+        use spacetimedb_lib::db::raw_def::v10::{CaseConversionPolicy, RawModuleDefV10Builder};
+
+        for policy in [CaseConversionPolicy::SnakeCase, CaseConversionPolicy::None] {
+            for canonical_name in [None, Some("WireHandler")] {
+                let mut builder = RawModuleDefV10Builder::new();
+                builder.set_case_conversion_policy(policy);
+                builder.add_http_handler("GetSimple");
+                builder.add_http_route("GetSimple", MethodOrAny::Any, "/get");
+                if let Some(canonical_name) = canonical_name {
+                    let mut names = ExplicitNames::default();
+                    names.insert_function("GetSimple", canonical_name);
+                    builder.add_http_handler("WireHandler");
+                    builder.add_http_route("WireHandler", MethodOrAny::Any, "/other");
+                    names.insert_function("WireHandler", "OtherHandler");
+                    builder.add_explicit_names(names);
+                }
+                let original: ModuleDef = builder.finish().try_into().expect("valid module");
+                let roundtrip = ModuleDef::try_from(RawModuleDefV10::from(original.clone()))
+                    .expect("valid roundtripped HTTP routes");
+
+                assert_eq!(original.http_handlers, roundtrip.http_handlers);
+                assert_eq!(original.http_routes, roundtrip.http_routes);
+            }
+        }
+    }
+
+    #[test]
+    fn v10_roundtrip_preserves_column_defaults() {
+        use spacetimedb_lib::db::raw_def::v10::RawModuleDefV10Builder;
+
+        let mut builder = RawModuleDefV10Builder::new();
+        builder
+            .build_table_with_new_type(
+                "Apples",
+                ProductType::from([("id", AlgebraicType::U64), ("count", AlgebraicType::U16)]),
+                true,
+            )
+            .with_default_column_value(1, AlgebraicValue::U16(12))
+            .finish();
+
+        let module_def: ModuleDef = builder.finish().try_into().expect("valid module");
+        let raw = RawModuleDefV10::from(module_def);
+        let tables = raw.tables().expect("tables section");
+        let defaults = &tables[0].default_values;
+        assert_eq!(defaults.len(), 1);
+        assert_eq!(defaults[0].col_id, ColId(1));
+        assert_eq!(
+            defaults[0].value,
+            spacetimedb_sats::bsatn::to_vec(&AlgebraicValue::U16(12))
+                .unwrap()
+                .into()
+        );
+    }
+
+    #[test]
     fn validate_new_column_with_malformed_value() {
         let mut old_builder = RawModuleDefV9Builder::new();
         old_builder
@@ -2052,5 +3121,256 @@ mod tests {
             .filter(|e| matches!(e, ValidationError::ColumnDefaultValueMalformed { .. }))
             .count()
             == 2))
+    }
+
+    #[test]
+    fn submodule_reducer_ids_are_depth_first() {
+        use spacetimedb_lib::db::raw_def::v10::{RawModuleDefV10Builder, RawModuleDefV10Section, RawSubmoduleV10};
+
+        // baz library: 1 reducer
+        let mut baz_builder = RawModuleDefV10Builder::new();
+        baz_builder.add_reducer("baz_reduce", ProductType::unit());
+
+        // auth library: 1 own reducer, uses baz as a submodule
+        let mut auth_builder = RawModuleDefV10Builder::new();
+        auth_builder.add_reducer("auth_verify", ProductType::unit());
+        let mut auth_raw = auth_builder.finish();
+        auth_raw
+            .sections
+            .push(RawModuleDefV10Section::Submodules(vec![RawSubmoduleV10 {
+                namespace: "baz".to_string(),
+                module: baz_builder.finish(),
+            }]));
+
+        // consumer: 2 own reducers, uses auth as a submodule
+        let mut consumer_builder = RawModuleDefV10Builder::new();
+        consumer_builder.add_reducer("consumer_a", ProductType::unit());
+        consumer_builder.add_reducer("consumer_b", ProductType::unit());
+        let mut consumer_raw = consumer_builder.finish();
+        consumer_raw
+            .sections
+            .push(RawModuleDefV10Section::Submodules(vec![RawSubmoduleV10 {
+                namespace: "auth".to_string(),
+                module: auth_raw,
+            }]));
+
+        let def: ModuleDef = consumer_raw.try_into().expect("valid module");
+
+        // Total count: 2 consumer + 1 auth + 1 baz
+        assert_eq!(def.reducer_count(), 4);
+
+        // Depth-first order: consumer_a=0, consumer_b=1, auth_verify=2, baz_reduce=3
+        let ids_and_defs = def.reducer_ids_and_defs();
+        assert_eq!(ids_and_defs.len(), 4);
+        assert_eq!(ids_and_defs[0].0, ReducerId(0));
+        assert_eq!(&*ids_and_defs[0].1.name, "consumer_a");
+        assert_eq!(ids_and_defs[1].0, ReducerId(1));
+        assert_eq!(&*ids_and_defs[1].1.name, "consumer_b");
+        assert_eq!(ids_and_defs[2].0, ReducerId(2));
+        // A submodule reducer's `name` is qualified; `local()` is the name within its module.
+        assert_eq!(&*ids_and_defs[2].1.name, "auth.auth_verify");
+        assert_eq!(&**ids_and_defs[2].1.name.local(), "auth_verify");
+        assert_eq!(ids_and_defs[3].0, ReducerId(3));
+        assert_eq!(&*ids_and_defs[3].1.name, "auth.baz.baz_reduce");
+        assert_eq!(&**ids_and_defs[3].1.name.local(), "baz_reduce");
+
+        // get_reducer_by_id resolves submodule reducer IDs correctly
+        assert_eq!(&*def.reducer_by_id(ReducerId(2)).name, "auth.auth_verify");
+        assert_eq!(&*def.reducer_by_id(ReducerId(3)).name, "auth.baz.baz_reduce");
+        assert!(def.get_reducer_by_id(ReducerId(4)).is_none());
+
+        // reducer_by_name routes plain names to own reducers
+        let (id, rdef) = def.reducer_by_name("consumer_a").expect("plain name resolves");
+        assert_eq!(id, ReducerId(0));
+        assert_eq!(&*rdef.name, "consumer_a");
+
+        // reducer_by_name routes qualified names to submodule reducers
+        let (id, rdef) = def
+            .reducer_by_name("auth.auth_verify")
+            .expect("qualified name resolves");
+        assert_eq!(id, ReducerId(2));
+        assert_eq!(&*rdef.name, "auth.auth_verify");
+
+        // reducer_by_name routes deeply nested qualified names
+        let (id, rdef) = def
+            .reducer_by_name("auth.baz.baz_reduce")
+            .expect("nested qualified name resolves");
+        assert_eq!(id, ReducerId(3));
+        assert_eq!(&*rdef.name, "auth.baz.baz_reduce");
+
+        // Non-existent names return None
+        assert!(def.reducer_by_name("auth.nonexistent").is_none());
+        assert!(def.reducer_by_name("nonexistent").is_none());
+        assert!(def.reducer_by_name("nonamespace.auth_verify").is_none());
+    }
+
+    #[test]
+    fn reducer_signature_hash_tracks_reachable_types_not_global_ids() {
+        #[derive(Clone, Copy, Debug)]
+        enum SignaturePart {
+            Parameter,
+            OkReturn,
+            ErrReturn,
+        }
+
+        fn hash_for(mut typespace: Typespace, value_type: AlgebraicType, part: SignaturePart) -> spacetimedb_lib::Hash {
+            // Reserve a slot so Node can refer to itself through its children.
+            let node = typespace.add(AlgebraicType::unit());
+            typespace[node] = AlgebraicType::product([
+                ("value", value_type),
+                ("children", AlgebraicType::array(AlgebraicType::Ref(node))),
+            ]);
+
+            // Put the recursive type in one signature position at a time, keeping
+            // the other positions fixed so each traversal path is checked separately.
+            let node = AlgebraicType::Ref(node);
+            let (param_type, ok_return_type, err_return_type) = match part {
+                SignaturePart::Parameter => (node, AlgebraicType::unit(), AlgebraicType::unit()),
+                SignaturePart::OkReturn => (AlgebraicType::unit(), node, AlgebraicType::unit()),
+                SignaturePart::ErrReturn => (AlgebraicType::unit(), AlgebraicType::unit(), node),
+            };
+            let params = ProductType::from([("node", param_type)]);
+            reducer_signature_hash(&params, &ok_return_type, &err_return_type, &typespace)
+        }
+
+        // This unused definition moves Node from Ref(0) to Ref(1) without
+        // changing its structure or making another type reachable from it.
+        let mut with_unrelated_type = Typespace::default();
+        with_unrelated_type.add(AlgebraicType::product([("other", AlgebraicType::Bool)]));
+
+        for part in [
+            SignaturePart::Parameter,
+            SignaturePart::OkReturn,
+            SignaturePart::ErrReturn,
+        ] {
+            let original = hash_for(Typespace::default(), AlgebraicType::U64, part);
+            let renumbered = hash_for(with_unrelated_type.clone(), AlgebraicType::U64, part);
+            let changed = hash_for(Typespace::default(), AlgebraicType::String, part);
+
+            assert_eq!(original, renumbered, "unrelated types must not affect {part:?}");
+            assert_ne!(original, changed, "changing Node.value must affect {part:?}");
+        }
+    }
+
+    #[test]
+    fn reducer_signature_hash_uses_schema_parameter_names() {
+        use spacetimedb_lib::db::raw_def::v10::RawModuleDefV10Builder;
+
+        // The parameter references Message, which contains an array of MessagePart
+        // references. Hashing must follow both levels, including the nested fields.
+        let mut builder = RawModuleDefV10Builder::new();
+        let part_type =
+            AlgebraicType::product([("sender", AlgebraicType::identity()), ("text", AlgebraicType::String)]);
+        let part_ref = builder.add_algebraic_type([], "MessagePart", part_type.clone(), false);
+        let message_type = AlgebraicType::product([
+            ("label", AlgebraicType::option(AlgebraicType::String)),
+            ("parts", AlgebraicType::array(AlgebraicType::Ref(part_ref))),
+        ]);
+        let message_ref = builder.add_algebraic_type([], "Message", message_type.clone(), false);
+        builder.add_reducer(
+            "receive",
+            ProductType::from([
+                ("messageBody", AlgebraicType::Ref(message_ref)),
+                ("requestId", AlgebraicType::U64),
+            ]),
+        );
+        // These type references belong to the child, not the parent typespace.
+        let mut parent = RawModuleDefV10Builder::new();
+        parent.add_submodule("child", builder.finish());
+        let def: ModuleDef = parent.finish().try_into().expect("valid module");
+        let (_, reducer, owning) = def.reducer_by_name_with_module("child.receive").unwrap();
+        // Validation applies the module's naming policy to the source parameter names.
+        let expected_params = ProductType::from([
+            ("message_body", AlgebraicType::Ref(message_ref)),
+            ("request_id", AlgebraicType::U64),
+        ]);
+        assert_eq!(reducer.params(), expected_params);
+
+        let hash = reducer_signature_hash(
+            &reducer.params(),
+            &reducer.ok_return_type,
+            &reducer.err_return_type,
+            owning.typespace(),
+        );
+        // Rebuild just the referenced definitions, without the surrounding module.
+        let mut typespace: Typespace = [part_type, message_type].into_iter().collect();
+        // Source-language spelling is irrelevant when the schema names agree.
+        assert_eq!(
+            hash,
+            reducer_signature_hash(
+                &expected_params,
+                &reducer.ok_return_type,
+                &reducer.err_return_type,
+                &typespace,
+            )
+        );
+
+        // Keep the parameter names and reference ids fixed, but change MessagePart.text
+        // from String to U64. The hash must include the referenced definition's contents.
+        typespace[part_ref] =
+            AlgebraicType::product([("sender", AlgebraicType::identity()), ("text", AlgebraicType::U64)]);
+        assert_ne!(
+            hash,
+            reducer_signature_hash(
+                &expected_params,
+                &reducer.ok_return_type,
+                &reducer.err_return_type,
+                &typespace,
+            )
+        );
+    }
+
+    #[test]
+    fn reducer_signature_hash_tracks_return_types() {
+        let hash_for = |ok, err| reducer_signature_hash(&ProductType::unit(), &ok, &err, &Typespace::default());
+        // With no parameters, only the success and error types contribute to these differences.
+        let base = hash_for(AlgebraicType::unit(), AlgebraicType::String);
+        // Changing either return type independently changes the signature.
+        assert_ne!(base, hash_for(AlgebraicType::U64, AlgebraicType::String));
+        assert_ne!(base, hash_for(AlgebraicType::unit(), AlgebraicType::U64));
+        // Success and error are distinct positions, even when the same two types are used.
+        assert_ne!(base, hash_for(AlgebraicType::String, AlgebraicType::unit()));
+    }
+
+    #[test]
+    fn reducer_signature_hash_tracks_contract() {
+        // Keep return types fixed to isolate changes to the parameters.
+        let hash_for = |params: ProductType| {
+            reducer_signature_hash(
+                &params,
+                &AlgebraicType::unit(),
+                &AlgebraicType::String,
+                &Typespace::default(),
+            )
+        };
+        let base = hash_for(ProductType::from([
+            ("a", AlgebraicType::U64),
+            ("b", AlgebraicType::String),
+        ]));
+
+        // BSATN arguments are positional, so reordering parameters changes the contract.
+        assert_ne!(
+            base,
+            hash_for(ProductType::from([
+                ("b", AlgebraicType::String),
+                ("a", AlgebraicType::U64)
+            ]))
+        );
+        // Names also matter: outbox columns are matched to reducer parameters by name.
+        assert_ne!(
+            base,
+            hash_for(ProductType::from([
+                ("renamed", AlgebraicType::U64),
+                ("b", AlgebraicType::String)
+            ]))
+        );
+        // Keeping names and order unchanged must not hide a parameter type change.
+        assert_ne!(
+            base,
+            hash_for(ProductType::from([
+                ("a", AlgebraicType::U32),
+                ("b", AlgebraicType::String)
+            ]))
+        );
     }
 }

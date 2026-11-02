@@ -37,7 +37,9 @@ FIELD_PrimaryKeyAutoInc(entity, id)
 FIELD_Index(entity, name)
 ```
 
-Options: `SPACETIMEDB_TABLE(Type, accessor, Public|Private)`
+Options:
+- `SPACETIMEDB_TABLE(Type, accessor, Public|Private)`: regular table
+- `SPACETIMEDB_TABLE(Type, accessor, Public|Private, true)`: event table
 
 Field constraints:
 - `FIELD_PrimaryKey(accessor, field)`: primary key
@@ -75,7 +77,7 @@ FIELD_Index(entity, name)
 FIELD_NamedMultiColumnIndex(score, by_player_and_level, player_id, level)
 ```
 
-Range queries (requires `#include <spacetimedb/range_queries.h>`):
+Range queries (included by `spacetimedb.h`; include `<spacetimedb/range_queries.h>` directly only when not using the umbrella header):
 ```cpp
 ctx.db[user_age].filter(range_inclusive(uint8_t(18), uint8_t(65)));
 ctx.db[user_age].filter(range_from(uint8_t(18)));

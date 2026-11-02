@@ -4,12 +4,16 @@
 import { ScheduleAt } from 'spacetimedb';
 import {
   schema,
+  SyncResponse,
   table,
   t,
   type Infer,
   type InferTypeOfRow,
   errors,
+  Router,
 } from 'spacetimedb/server';
+import * as libSubmodule from './lib_submodule';
+import idcReceiver from './idc_receiver';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // TYPE ALIASES
@@ -153,10 +157,35 @@ const playerLikeRow = t.row({
   name: t.string().unique(),
 });
 
+const repeatingTestArgTable = table(
+  {
+    name: 'repeating_test_arg',
+  },
+  repeatingTestArg
+);
+
 // ─────────────────────────────────────────────────────────────────────────────
 // SCHEMA (tables + indexes + visibility)
 // ─────────────────────────────────────────────────────────────────────────────
+const idcOutbox = table(
+  {
+    name: 'idc_outbox',
+    public: true,
+    outbox: { receiver: idcReceiver.reducers.receivePing },
+    indexes: [{ accessor: 'by_tag', algorithm: 'btree', columns: ['tag'] }],
+  },
+  {
+    id: t.u64().primaryKey().autoInc(),
+    tag: t.string(),
+    target: idcReceiver.identity().target(),
+    message: t.string().param({ name: 'body' }),
+  }
+);
+const idcNoopOutbox = idcReceiver.outbox.noop();
+
 const spacetimedb = schema({
+  idcOutbox,
+  idcNoopOutbox,
   // person (public) with btree index on age
   person: table(
     {
@@ -216,16 +245,10 @@ const spacetimedb = schema({
   // pk_multi_identity with multiple constraints
   pkMultiIdentity: table({ name: 'pk_multi_identity' }, pkMultiIdentityRow),
 
-  // repeating_test_arg table with scheduled(repeating_test)
-  repeatingTestArg: table(
-    {
-      name: 'repeating_test_arg',
-      scheduled: (): any => repeatingTest,
-    },
-    repeatingTestArg
-  ),
+  // repeating_test_arg table scheduled by repeatingTest
+  repeatingTestArg: repeatingTestArgTable,
 
-  // nonrepeating_test_arg table with scheduled(nonrepeating_test)
+  // nonrepeating_test_arg table with legacy scheduled(nonrepeating_test)
   nonrepeatingTestArg: table(
     {
       name: 'nonrepeating_test_arg',
@@ -244,7 +267,16 @@ const spacetimedb = schema({
     playerLikeRow
   ),
   tableToRemove: table({ name: 'table_to_remove' }, { id: t.u32() }),
-});
+  // Mounted under a camelCase accessor so the canonical namespace (`my_lib`)
+  // differs from the name module code uses (`ctx.db.myLib`, `ctx.as.myLib`).
+  myLib: libSubmodule,
+}, { env: {
+  MISSING: t.string().optional(),
+  EMPTY: t.string().optional(),
+  UTF8: t.string().optional(),
+  NUL: t.string().optional(),
+  MAXIMUM: t.string().optional(),
+} });
 export default spacetimedb;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -261,6 +293,23 @@ export const myPlayer = spacetimedb.view(
 // ─────────────────────────────────────────────────────────────────────────────
 // REDUCERS (mirroring Rust order & behavior)
 // ─────────────────────────────────────────────────────────────────────────────
+
+export const enqueueIdc = spacetimedb.reducer(
+  { target: idcReceiver.identity(), message: t.string() },
+  (ctx, { target, message }) => {
+    ctx.db.idcOutbox.insert({ id: 0n, tag: 'example', target, message });
+    ctx.db.idcNoopOutbox.insert({ msgId: 0n, target });
+  }
+);
+
+export const onIdcResult = spacetimedb.reducer(
+  { onResult: idcOutbox },
+  { row: idcOutbox.rowType, result: t.result(t.unit(), t.string()) },
+  (_ctx, { row, result }) => {
+    if ('err' in result)
+      console.warn(`IDC message ${row.id} (${row.tag}) failed: ${result.err}`);
+  }
+);
 
 // init
 export const init = spacetimedb.init(ctx => {
@@ -282,6 +331,7 @@ export const init = spacetimedb.init(ctx => {
 
 // repeating_test
 export const repeatingTest = spacetimedb.reducer(
+  { onSchedule: repeatingTestArgTable },
   { arg: repeatingTestArg },
   (ctx, { arg }) => {
     const delta = ctx.timestamp.since(arg.prev_time); // adjust if API differs
@@ -520,3 +570,70 @@ export const getMySchemaViaHttp = spacetimedb.procedure(t.string(), ctx => {
     throw e;
   }
 });
+
+// useSubmodule: calls the lib submodule's libInsert reducer cross-namespace.
+export const useSubmodule = spacetimedb.reducer(
+  { value: t.string() },
+  (ctx, { value }) => {
+    libSubmodule.libInsert(ctx.as.myLib, { value });
+  }
+);
+
+// useSubmoduleProcedure: calls the lib submodule's libCount procedure and returns the result.
+export const useSubmoduleProcedure = spacetimedb.procedure(t.u64(), ctx =>
+  libSubmodule.libCount(ctx.as.myLib, {})
+);
+
+export const getSimple = spacetimedb.httpHandler(
+  (_ctx, _req) => new SyncResponse('ok')
+);
+
+// Delegates to the lib submodule's HTTP handler, demonstrating cross-namespace HTTP dispatch.
+export const libHello = spacetimedb.httpHandler((ctx, req) => {
+  return libSubmodule.libHello(ctx.as.myLib, req);
+});
+
+// Ordinary JS delegation retains this root host entry, even with ctx.as.myLib.
+// Direct host dispatch to my_lib.envReadHandler is the separate denied case.
+export const envReadChildHandler = spacetimedb.httpHandler((ctx, req) =>
+  libSubmodule.envReadHandler(ctx.as.myLib, req)
+);
+
+// Root entries must use the checked accessor too; returning raw st_env SQL is
+// forbidden even when the same entry could legitimately call ctx.env.get.
+export const envReadRootSqlView = spacetimedb.view(
+  { public: true },
+  t.array(t.object('EnvSqlRow', { key: t.string(), value: t.string() })),
+  ctx => libSubmodule.uncheckedEnvironmentQuery(ctx.from.player)
+);
+
+export const router = spacetimedb.httpRouter(
+  new Router().get('/get', getSimple).get('/lib-hello', libHello).get('/env-child', envReadChildHandler)
+);
+
+// Dedicated environment ABI integration exercised by crates/testing.
+export const expectEnvironment = spacetimedb.reducer(
+  { name: 'expect_environment' },
+  { key: t.string(), expected: t.option(t.string()) },
+  (ctx, { key, expected }) => {
+    if (libSubmodule.readRootEnvironmentHelper() !== ctx.env.get('EMPTY')) throw new Error('helper environment scope mismatch');
+    if (ctx.env.EMPTY !== (ctx.env.get('EMPTY') ?? undefined)) throw new Error('named environment mismatch');
+    if (ctx.env.get(key) !== (expected ?? null)) {
+      throw new Error('environment value mismatch');
+    }
+  }
+);
+export const readEnvironment = spacetimedb.procedure(
+  { name: 'read_environment' },
+  { key: t.string() },
+  t.option(t.string()),
+  (ctx, { key }) => {
+    const outside = ctx.env.get(key);
+    ctx.withTx(tx => {
+      if (tx.env.get(key) !== outside) {
+        throw new Error('transaction environment value mismatch');
+      }
+    });
+    return outside ?? undefined;
+  }
+);

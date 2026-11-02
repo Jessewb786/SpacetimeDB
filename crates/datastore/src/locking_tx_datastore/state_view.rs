@@ -5,18 +5,20 @@ use crate::locking_tx_datastore::mut_tx::{IndexScanPoint, IndexScanRanged};
 use crate::system_tables::{
     ConnectionIdViaU128, StColumnAccessorFields, StColumnAccessorRow, StColumnFields, StColumnRow,
     StConnectionCredentialsFields, StConnectionCredentialsRow, StConstraintFields, StConstraintRow, StEventTableFields,
-    StIndexAccessorFields, StIndexAccessorRow, StIndexFields, StIndexRow, StScheduledFields, StScheduledRow,
+    StEventTableRow, StIndexAccessorFields, StIndexAccessorRow, StIndexFields, StIndexRow, StOutboundMsgFields,
+    StOutboundStreamFields, StOutboundStreamRow, StOutboxFields, StOutboxRow, StScheduledFields, StScheduledRow,
     StSequenceFields, StSequenceRow, StTableAccessorFields, StTableAccessorRow, StTableFields, StTableRow,
-    StViewFields, StViewParamFields, StViewRow, SystemTable, ST_COLUMN_ACCESSOR_ID, ST_COLUMN_ID,
+    StViewFields, StViewParamFields, StViewParamRow, StViewRow, SystemTable, ST_COLUMN_ACCESSOR_ID, ST_COLUMN_ID,
     ST_CONNECTION_CREDENTIALS_ID, ST_CONSTRAINT_ID, ST_EVENT_TABLE_ID, ST_INDEX_ACCESSOR_ID, ST_INDEX_ID,
-    ST_SCHEDULED_ID, ST_SEQUENCE_ID, ST_TABLE_ACCESSOR_ID, ST_TABLE_ID, ST_VIEW_ID, ST_VIEW_PARAM_ID,
+    ST_OUTBOUND_MSG_ID, ST_OUTBOUND_STREAM_ID, ST_OUTBOX_ID, ST_SCHEDULED_ID, ST_SEQUENCE_ID, ST_TABLE_ACCESSOR_ID,
+    ST_TABLE_ID, ST_VIEW_ID, ST_VIEW_PARAM_ID,
 };
 use anyhow::anyhow;
 use core::ops::RangeBounds;
 use spacetimedb_lib::ConnectionId;
-use spacetimedb_primitives::{ColList, TableId};
-use spacetimedb_sats::AlgebraicValue;
-use spacetimedb_schema::schema::{ColumnSchema, TableSchema, ViewDefInfo};
+use spacetimedb_primitives::{col_list, ColList, TableId};
+use spacetimedb_sats::{product, AlgebraicValue};
+use spacetimedb_schema::schema::{ColumnSchema, IndexSchema, OutboxSchema, TableSchema, ViewDefInfo};
 use spacetimedb_table::table::IndexScanPointIter;
 use spacetimedb_table::{
     blob_store::HashMapBlobStore,
@@ -82,6 +84,30 @@ pub trait StateView {
         value: &'r AlgebraicValue,
     ) -> Result<Self::IterByColEq<'a, 'r>>;
 
+    /// Find a sender-side stream by its durable stream id.
+    fn st_outbound_stream_by_id(&self, stream_id: u64) -> Result<Option<StOutboundStreamRow>> {
+        self.iter_by_col_eq(
+            ST_OUTBOUND_STREAM_ID,
+            StOutboundStreamFields::StreamId,
+            &stream_id.into(),
+        )?
+        .map(StOutboundStreamRow::try_from)
+        .next()
+        .transpose()
+    }
+
+    /// Find a pending delivery without decoding its payload.
+    fn outbound_msg_by_stream_seq(&self, stream_id: u64, seq: u64) -> Result<Option<RowRef<'_>>> {
+        let key = AlgebraicValue::Product(product![stream_id, seq]);
+        Ok(self
+            .iter_by_col_eq(
+                ST_OUTBOUND_MSG_ID,
+                col_list![StOutboundMsgFields::StreamId, StOutboundMsgFields::Seq],
+                &key,
+            )?
+            .next())
+    }
+
     /// Look up the `st_table` row which describes `table_id`.
     ///
     /// Default method calls `iter_by_col_eq`.
@@ -94,6 +120,14 @@ pub trait StateView {
             .next()
             .ok_or_else(|| TableError::IdNotFound(SystemTable::st_table, table_id.into()))?;
         StTableRow::try_from(row_ref)
+    }
+
+    fn find_st_event_table_row(&self, table_id: TableId) -> Result<StEventTableRow> {
+        let row_ref = self
+            .iter_by_col_eq(ST_EVENT_TABLE_ID, StEventTableFields::TableId, &table_id.into())?
+            .next()
+            .ok_or_else(|| TableError::IdNotFound(SystemTable::st_event_table, table_id.into()))?;
+        StEventTableRow::try_from(row_ref)
     }
 
     /// Look up an `st_table_accessor` row by its accessor name
@@ -118,6 +152,22 @@ pub trait StateView {
         .next()
         .map(StIndexAccessorRow::try_from)
         .transpose()
+    }
+
+    /// Look up an `st_index_accessor` row by its canonical index name.
+    fn find_st_index_accessor_row_by_index_name(&self, index_name: &str) -> Result<Option<StIndexAccessorRow>> {
+        match self.iter_by_col_eq(
+            ST_INDEX_ACCESSOR_ID,
+            StIndexAccessorFields::IndexName,
+            &index_name.into(),
+        ) {
+            Ok(mut iter) => iter.next().map(StIndexAccessorRow::try_from).transpose(),
+            // `schema_for_table_raw` is called while restoring snapshots,
+            // before `migrate_system_tables` creates newer system tables.
+            // Treat a missing `st_index_accessor` as "no aliases yet" here.
+            Err(DatastoreError::Table(TableError::IdNotFound(..))) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     /// Look up an `st_column_accessor` row by its canonical table and column names
@@ -187,7 +237,14 @@ pub trait StateView {
         // Look up the indexes for the table in question.
         let indexes = self
             .iter_by_col_eq(ST_INDEX_ID, StIndexFields::TableId, value_eq)?
-            .map(|row| StIndexRow::try_from(row).map(Into::into))
+            .map(|row| {
+                let row = StIndexRow::try_from(row)?;
+                let mut index_schema = IndexSchema::from(row);
+                index_schema.alias = self
+                    .find_st_index_accessor_row_by_index_name(index_schema.index_name.as_ref())?
+                    .map(|row| row.accessor_name);
+                Ok(index_schema)
+            })
             .collect::<Result<Vec<_>>>()?;
 
         let schedule = self
@@ -209,15 +266,20 @@ pub trait StateView {
             .map(|mut iter| {
                 iter.next().map(|row| -> Result<_> {
                     let row = StViewRow::try_from(row)?;
-                    let has_args = self
+
+                    // Look up the view's parameters, in position order.
+                    let mut params = self
                         .iter_by_col_eq(ST_VIEW_PARAM_ID, StViewParamFields::ViewId, &row.view_id.into())?
-                        .next()
-                        .is_some();
+                        .map(StViewParamRow::try_from)
+                        .collect::<Result<Vec<_>>>()?;
+                    params.sort_by_key(|param| param.param_pos);
 
                     Ok(ViewDefInfo {
                         view_id: row.view_id,
-                        has_args,
                         is_anonymous: row.is_anonymous,
+                        params: ViewDefInfo::params_from_columns(
+                            params.into_iter().map(|param| (param.param_name, param.param_type.0)),
+                        ),
                     })
                 })
             })
@@ -238,6 +300,21 @@ pub trait StateView {
             Err(DatastoreError::Table(TableError::IdNotFound(..))) => false,
             Err(e) => return Err(e),
         };
+
+        // During restore from snapshots produced before IDC outboxes existed,
+        // `st_outbox` is missing until `migrate_system_tables` runs.
+        // Treat that as "no outbox metadata" while reconstructing raw schemas.
+        let outbox = match self.iter_by_col_eq(ST_OUTBOX_ID, StOutboxFields::TableId, value_eq) {
+            Ok(mut iter) => iter
+                .next()
+                .map(StOutboxRow::try_from)
+                .transpose()?
+                .map(OutboxSchema::try_from)
+                .transpose()?,
+            Err(DatastoreError::Table(TableError::IdNotFound(..))) => None,
+            Err(e) => return Err(e),
+        };
+
         // During restore from snapshots produced before `st_table_accessor` existed,
         // this system table is missing until `migrate_system_tables` runs.
         // Handle that here so schema reconstruction can proceed during restore.
@@ -268,6 +345,7 @@ pub trait StateView {
             table_primary_key,
             is_event,
             table_alias,
+            outbox,
         ))
     }
 
@@ -285,7 +363,7 @@ pub trait StateView {
     }
 
     fn get_jwt_payload(&self, connection_id: ConnectionId) -> Result<Option<String>> {
-        log::info!("Getting JWT payload for connection id: {}", connection_id.to_hex());
+        log::trace!("Getting JWT payload for connection id: {}", connection_id.to_hex());
         let mut buf: Vec<u8> = Vec::new();
         self.iter_by_col_eq(
             ST_CONNECTION_CREDENTIALS_ID,

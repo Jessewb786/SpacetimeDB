@@ -13,14 +13,14 @@ metadata:
 
 # SpacetimeDB Core Concepts
 
-SpacetimeDB is a relational database that is also a server. It lets you upload application logic directly into the database via WebAssembly modules, eliminating the traditional web/game server layer entirely.
+SpacetimeDB is a relational database that is also a server. It lets you upload application logic directly into the database as modules, eliminating the traditional web/game server layer entirely. Rust, C#, and C++ modules compile to WebAssembly, while TypeScript modules run on V8.
 
 ---
 
 ## Critical Rules
 
 1. **Reducers are transactional.** They do not return data to callers. Use subscriptions to read data.
-2. **Reducers must be deterministic.** No filesystem, network, timers, or random. All state must come from tables.
+2. **Reducers must be deterministic.** Do not use filesystem, network, external clocks, or external random sources in reducers. Use the reducer context (`ctx`) for SpacetimeDB-provided timestamp and deterministic random values.
 3. **Read data via tables/subscriptions**, not reducer return values. Clients get data through subscribed queries.
 4. **Auto-increment IDs are not sequential.** Gaps are normal, do not use for ordering. Use timestamps or explicit sequence columns.
 5. **`ctx.sender` is the authenticated principal.** Never trust identity passed as arguments.
@@ -87,7 +87,7 @@ Best practices:
 
 ## Modules
 
-Modules are WebAssembly bundles containing application logic that runs inside the database.
+Modules contain application logic that runs inside the database.
 
 - **Tables**: Define the data schema
 - **Reducers**: Define callable functions that modify state
@@ -98,6 +98,12 @@ Modules are WebAssembly bundles containing application logic that runs inside th
 Server-side modules can be written in: Rust, C#, TypeScript, C++
 
 Lifecycle: Write → Compile → Publish (`spacetime publish`) → Hot-swap (republish without disconnecting clients)
+
+## Inter-Database Communication
+
+Reducers can't make network requests, but a reducer can call a reducer in another database on the same server through an **outbox table** (async IDC). The reducer inserts a row, and after its transaction commits, the row is delivered as a reducer call to the target database exactly once, in order with other calls through the same outbox to the same database. The sending reducer doesn't wait, and the two databases don't commit together: the receiving reducer runs later in its own transaction and can fail. An optional `on_result` reducer in the sending database receives the result, so it can undo or record the work.
+
+Use it to split an application into databases that scale and deploy independently, such as a lobby that sends players to separate game world databases. Only Rust and TypeScript modules can declare outbox tables. See the language-specific server skills for syntax.
 
 ## Identity
 

@@ -1,9 +1,45 @@
-import type { ProcedureExport, ReducerExport } from '../server';
 import type { ProductType } from './algebraic_type';
-import type { RawScheduleDefV10, RawTableDefV10 } from './autogen/types';
+import type {
+  RawOutboxDefV10,
+  RawScheduleDefV10,
+  RawTableDefV10,
+} from './autogen/types';
 import type { IndexOpts } from './indexes';
 import type { ModuleContext } from './schema';
 import type { ColumnBuilder, RowBuilder } from './type_builders';
+import type { HasExactlyOneKnownKey } from './type_util';
+import type { ProcedureExport, ReducerExport } from '../server';
+
+/**
+ * Internal erased form of a scheduled reducer/procedure export.
+ *
+ * The legacy `TableOpts.scheduled` option checks the scheduled function shape
+ * before it reaches `TableSchema`. From here, schedule resolution only needs
+ * the export object identity to look up its registered function name.
+ */
+export type UntypedScheduledFunctionExport =
+  | ReducerExport<any, any>
+  | ProcedureExport<any, any, any>;
+
+export type TableSchedule = {
+  scheduleAtCol: number;
+  reducer: () => UntypedScheduledFunctionExport;
+};
+
+/** Outbox metadata before table and callback names are resolved. */
+export type OutboxMetadata = Omit<
+  RawOutboxDefV10,
+  'tableName' | 'onResultReducer'
+>;
+
+export type ScheduleTableForParams<Params extends Record<string, any>> =
+  HasExactlyOneKnownKey<Params> extends true
+    ? Params[keyof Params] extends RowBuilder<
+        infer Row extends Record<string, ColumnBuilder<any, any, any>>
+      >
+      ? TableSchema<Row, readonly IndexOpts<keyof Row & string>[]>
+      : never
+    : never;
 
 /**
  * Represents a handle to a database table, including its name, row type, and row spacetime type.
@@ -11,11 +47,20 @@ import type { ColumnBuilder, RowBuilder } from './type_builders';
 export type TableSchema<
   Row extends Record<string, ColumnBuilder<any, any, any>>,
   Idx extends readonly IndexOpts<keyof Row & string>[],
+  Outbox extends OutboxMetadata | undefined = OutboxMetadata | undefined,
 > = {
   /**
    * The name of the table.
    */
   readonly tableName?: string;
+
+  /**
+   * The outbox receiver and argument mapping, if this is an outbox table.
+   * Schema registration supplies the table name and resolves the result callback.
+   * Its presence marks an outbox, whose database handles expose only inserts
+   * and reads; the table builder types it as `undefined` for ordinary tables.
+   */
+  readonly outbox: Outbox;
 
   /**
    * The TypeBuilder representation of the type of the rows in the table.
@@ -50,12 +95,18 @@ export type TableSchema<
   }[];
 
   /**
-   * The schedule defined on the table, if any.
+   * The column id of the schedule-at column, if this table has a ScheduleAt column.
    */
-  readonly schedule?: {
-    scheduleAtCol: number;
-    reducer: () => ReducerExport<any, any> | ProcedureExport<any, any, any>;
-  };
+  readonly scheduleAtCol?: number;
+
+  /**
+   * The legacy schedule defined on the table, if any.
+   *
+   * @deprecated Prefer `spacetime.reducer({ onSchedule: table }, ...)` or
+   * `spacetime.procedure({ onSchedule: table }, ...)` so table definitions can
+   * live in a separate module from reducer/procedure definitions.
+   */
+  readonly schedule?: TableSchedule;
 };
 
 export type UntypedTableSchema = TableSchema<

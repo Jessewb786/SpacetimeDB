@@ -36,7 +36,7 @@ use super::{
     blob_store::{BlobHash, BlobStore},
     fixed_bit_set::FixedBitSet,
     fixed_bit_set::IterSet,
-    indexes::{max_rows_in_page, Byte, Bytes, PageOffset, PAGE_HEADER_SIZE, PAGE_SIZE},
+    indexes::{max_rows_in_page, Byte, Bytes, PageOffset},
     static_assert_size,
     table::BlobNumBytes,
     var_len::{is_granule_offset_aligned, VarLenGranule, VarLenGranuleHeader, VarLenMembers, VarLenRef},
@@ -337,7 +337,7 @@ impl MemoryUsage for PageHeader {
     }
 }
 
-static_assert_size!(PageHeader, PAGE_HEADER_SIZE);
+static_assert_size!(PageHeader, super::indexes::PAGE_HEADER_SIZE);
 
 impl PageHeader {
     /// Returns a new `PageHeader` proper a [`Page`] for holding at most `max_rows_in_page` rows.
@@ -381,6 +381,13 @@ impl PageHeader {
     #[cfg(test)]
     pub(super) fn present_rows_storage_ptr_for_test(&self) -> *const () {
         self.fixed.present_rows.storage().as_ptr().cast()
+    }
+
+    /// Returns the number of var-len granules available for allocation,
+    /// including those in the "gap" between the fixed-len and var-len part of the page.
+    fn available_var_len_granules(&self) -> usize {
+        self.var.freelist_len as usize
+            + VarLenGranule::space_to_granules(gap_remaining_size(self.var.first, self.fixed.last))
     }
 }
 
@@ -450,7 +457,7 @@ impl MemoryUsage for Page {
     }
 }
 
-static_assert_size!(Page, PAGE_SIZE);
+static_assert_size!(Page, super::indexes::PAGE_SIZE);
 
 /// A mutable view of the fixed-len section of a [`Page`].
 pub struct FixedView<'page> {
@@ -1195,6 +1202,12 @@ impl Page {
         self.header.var.num_granules as usize
     }
 
+    /// Returns the number of var-len granules free to store data,
+    /// including those in the "gap" between the fixed-len and var-len part of the page.
+    pub fn available_var_len_granules(&self) -> usize {
+        self.header.available_var_len_granules()
+    }
+
     #[cfg(test)]
     /// # Safety
     ///
@@ -1369,7 +1382,7 @@ impl Page {
 
     /// Returns whether the row is full with respect to storing a fixed row with `fixed_row_size`
     /// and no variable component.
-    pub fn is_full(&self, fixed_row_size: Size) -> bool {
+    pub(crate) fn is_full(&self, fixed_row_size: Size) -> bool {
         !self.has_space_for_row(fixed_row_size, 0)
     }
 

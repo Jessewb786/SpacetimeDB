@@ -1,19 +1,25 @@
+use spacetimedb_data_structures::error_stream::ErrorStream;
 use spacetimedb_data_structures::map::HashMap;
 use spacetimedb_lib::bsatn::Deserializer;
 use spacetimedb_lib::db::raw_def::v10::*;
+use spacetimedb_lib::db::raw_def::v9::Lifecycle;
 use spacetimedb_lib::db::view::{extract_view_return_product_type_ref, ViewKind};
 use spacetimedb_lib::de::DeserializeSeed as _;
-use spacetimedb_sats::{Typespace, WithTypespace};
+use spacetimedb_lib::http::character_is_acceptable_for_route_path;
+use spacetimedb_primitives::ReducerId;
+use spacetimedb_sats::{AlgebraicType, Typespace, WithTypespace};
 
 use crate::def::validate::v9::{
-    check_function_names_are_unique, check_scheduled_functions_exist, generate_schedule_name,
+    check_function_names_are_unique, check_scheduled_functions_exist, convert, generate_schedule_name,
     generate_unique_constraint_name, identifier, CoreValidator, TableValidator, ViewValidator,
 };
 use crate::def::*;
 use crate::error::ValidationError;
+use crate::identifier::{NamespacePath, NamespacedIdentifier};
+use crate::reducer_name::ReducerName;
 use crate::type_for_generate::ProductTypeDef;
 use crate::{def::validate::Result, error::TypeLocation};
-
+use spacetimedb_sats::raw_identifier::{RawIdentifier, RawNamespacedIdentifier};
 // Utitility struct to look up canonical names for tables, functions, and indexes based on the
 // explicit names provided in the `RawModuleDefV10`.
 #[derive(Default)]
@@ -21,6 +27,7 @@ pub struct ExplicitNamesLookup {
     pub tables: HashMap<RawIdentifier, RawIdentifier>,
     pub functions: HashMap<RawIdentifier, RawIdentifier>,
     pub indexes: HashMap<RawIdentifier, RawIdentifier>,
+    pub namespaces: HashMap<RawIdentifier, RawIdentifier>,
 }
 
 impl ExplicitNamesLookup {
@@ -28,6 +35,7 @@ impl ExplicitNamesLookup {
         let mut tables = HashMap::default();
         let mut functions = HashMap::default();
         let mut indexes = HashMap::default();
+        let mut namespaces = HashMap::default();
 
         for entry in ex.into_entries() {
             match entry {
@@ -40,6 +48,9 @@ impl ExplicitNamesLookup {
                 ExplicitNameEntry::Index(m) => {
                     indexes.insert(m.source_name, m.canonical_name);
                 }
+                ExplicitNameEntry::Namespace(m) => {
+                    namespaces.insert(m.source_name, m.canonical_name);
+                }
                 _ => {}
             }
         }
@@ -48,6 +59,7 @@ impl ExplicitNamesLookup {
             tables,
             functions,
             indexes,
+            namespaces,
         }
     }
 }
@@ -70,9 +82,10 @@ impl From<CaseConversionPolicy> for ValidationCase {
         }
     }
 }
-/// Validate a `RawModuleDefV9` and convert it into a `ModuleDef`,
+/// Validate a `RawModuleDefV10` and convert it into a `ModuleDef`,
 /// or return a stream of errors if the definition is invalid.
 pub fn validate(def: RawModuleDefV10) -> Result<ModuleDef> {
+    let environment = validate_environment(&def);
     let mut typespace = def.typespace().cloned().unwrap_or_else(|| Typespace::EMPTY.clone());
     let known_type_definitions = def.types().into_iter().flatten().map(|def| def.ty);
     let case_policy = def.case_conversion_policy().into();
@@ -81,12 +94,14 @@ pub fn validate(def: RawModuleDefV10) -> Result<ModuleDef> {
         .cloned()
         .map(ExplicitNamesLookup::new)
         .unwrap_or_default();
-    let mounts = def
-        .mounts()
-        .into_iter()
-        .flat_map(|mounts| mounts.iter().cloned())
-        .map(validate_mount)
-        .collect_all_errors::<Vec<_>>();
+    let view_primary_keys = def.view_primary_keys().cloned().unwrap_or_default();
+    // The parent chooses the namespaces its submodules are mounted under, so the parent's
+    // naming policy and explicit names decide their canonical form.
+    let submodules = validate_submodules(
+        def.submodules().into_iter().flat_map(|s| s.iter().cloned()).collect(),
+        case_policy,
+        &explicit_names,
+    );
 
     // Original `typespace` needs to be preserved to be assign `accesor_name`s to columns.
     let typespace_with_accessor_names = typespace.clone();
@@ -142,6 +157,18 @@ pub fn validate(def: RawModuleDefV10) -> Result<ModuleDef> {
         // Later on, in `check_function_names_are_unique`, we'll transform this into an `IndexMap`.
         .collect_all_errors::<Vec<_>>();
 
+    let http_handlers = def
+        .http_handlers()
+        .cloned()
+        .into_iter()
+        .flatten()
+        .map(|handler| {
+            validator
+                .validate_http_handler_def(handler)
+                .map(|handler_def| (handler_def.name.clone(), handler_def))
+        })
+        .collect_all_errors::<Vec<_>>();
+
     let views = def
         .views()
         .cloned()
@@ -194,6 +221,8 @@ pub fn validate(def: RawModuleDefV10) -> Result<ModuleDef> {
         })
         .unwrap_or_else(|| Ok(Vec::new()));
 
+    let raw_outboxes = def.outboxes().cloned().unwrap_or_default();
+
     // Validate lifecycle reducers - they reference reducers by name
     let lifecycle_validations = reducers
         .as_ref()
@@ -227,6 +256,19 @@ pub fn validate(def: RawModuleDefV10) -> Result<ModuleDef> {
                 .collect_all_errors::<Vec<_>>()
         })
         .unwrap_or_else(|| Ok(Vec::new()));
+
+    let http_handlers_and_routes = http_handlers.and_then(|handlers| {
+        let handlers = check_http_handler_names_are_unique(handlers)?;
+        let routes = def
+            .http_routes()
+            .cloned()
+            .into_iter()
+            .flatten()
+            .map(|route| validator.validate_http_route_def(route, &handlers))
+            .collect_all_errors::<Vec<_>>()?;
+        validate_http_routes_are_unique(&routes)?;
+        Ok((handlers, routes))
+    });
     // Combine all validation results
     let tables_types_reducers_procedures_views = (
         tables,
@@ -236,10 +278,22 @@ pub fn validate(def: RawModuleDefV10) -> Result<ModuleDef> {
         views,
         schedules,
         lifecycle_validations,
+        http_handlers_and_routes,
+        Ok(raw_outboxes),
     )
         .combine_errors()
         .and_then(
-            |(mut tables, types, reducers, procedures, views, schedules, lifecycles)| {
+            |(
+                mut tables,
+                types,
+                reducers,
+                procedures,
+                views,
+                schedules,
+                lifecycles,
+                http_handlers_and_routes,
+                raw_outboxes,
+            )| {
                 let (mut reducers, mut procedures, mut views) =
                     check_function_names_are_unique(reducers, procedures, views)?;
                 // Attach lifecycles to their respective reducers
@@ -248,11 +302,14 @@ pub fn validate(def: RawModuleDefV10) -> Result<ModuleDef> {
                 // Attach schedules to their respective tables
                 attach_schedules_to_tables(&mut tables, schedules)?;
 
+                attach_outboxes_to_tables(&mut tables, &mut reducers, raw_outboxes, &mut validator.core)?;
+
                 check_scheduled_functions_exist(&mut tables, &reducers, &procedures)?;
                 change_scheduled_functions_and_lifetimes_visibility(&tables, &mut reducers, &mut procedures)?;
+                attach_view_primary_keys(&mut views, view_primary_keys)?;
                 assign_query_view_primary_keys(&tables, &mut views);
 
-                Ok((tables, types, reducers, procedures, views))
+                Ok((tables, types, reducers, procedures, views, http_handlers_and_routes))
             },
         );
     let CoreValidator {
@@ -269,16 +326,22 @@ pub fn validate(def: RawModuleDefV10) -> Result<ModuleDef> {
         .map(|rls| (rls.sql.clone(), rls.to_owned()))
         .collect();
 
-    let (tables, types, reducers, procedures, views, mounts) = (tables_types_reducers_procedures_views, mounts)
-        .combine_errors()
-        .and_then(|((tables, types, reducers, procedures, views), mounts)| {
-            validate_mount_names_are_unique(mounts).map(|mounts| (tables, types, reducers, procedures, views, mounts))
-        })
-        .map_err(|errors: ValidationErrors| errors.sort_deduplicate())?;
+    let ((tables, types, reducers, procedures, views, (http_handlers, http_routes)), submodules, environment) =
+        (tables_types_reducers_procedures_views, submodules, environment)
+            .combine_errors()
+            .and_then(|(defs, submodules, environment)| {
+                let (tables, _, reducers, procedures, views, _) = &defs;
+                check_names_do_not_conflict_with_namespaces(tables, reducers, procedures, views, &submodules)?;
+                Ok((defs, submodules, environment))
+            })
+            .map_err(|errors: ValidationErrors| errors.sort_deduplicate())?;
 
     let typespace_for_generate = typespace_for_generate.finish();
 
-    Ok(ModuleDef {
+    let mut module_def = ModuleDef {
+        // Set by `apply_namespace` below.
+        path: NamespacePath::root(),
+        accessor_path: NamespacePath::root(),
         tables,
         reducers,
         views,
@@ -290,31 +353,189 @@ pub fn validate(def: RawModuleDefV10) -> Result<ModuleDef> {
         row_level_security_raw,
         lifecycle_reducers,
         procedures,
+        http_handlers,
+        http_routes,
         raw_module_def_version: RawModuleDefVersion::V10,
-        mounts,
-    })
+        submodules,
+        environment,
+    };
+
+    // Submodules were validated in isolation, so their defs carry root-relative names.
+    // Now that the tree is assembled, qualify every name by the namespace it is mounted
+    // under. This recurses, so nesting resolves at whichever level ends up outermost.
+    module_def.apply_namespace(&NamespacePath::root(), &NamespacePath::root());
+    #[cfg(debug_assertions)]
+    module_def.assert_namespaces_applied(&NamespacePath::root());
+
+    Ok(module_def)
 }
 
-fn validate_mount(mount: RawModuleMountV10) -> Result<(String, ModuleDef)> {
-    Identifier::new(mount.namespace.clone().into())
-        .map_err(|error| ValidationErrors::from(ValidationError::IdentifierError { error }))?;
-
-    Ok((mount.namespace, validate(mount.module)?))
+fn validate_environment(def: &RawModuleDefV10) -> Result<Option<spacetimedb_lib::environment::EnvironmentSchema>> {
+    let Some(declarations) = def.sections.iter().find_map(|section| match section {
+        RawModuleDefV10Section::Environment(declarations) => Some(declarations),
+        _ => None,
+    }) else {
+        return Ok(None);
+    };
+    let declarations = declarations.iter().map(|x| x.clone().into()).collect();
+    let schema = spacetimedb_lib::environment::EnvironmentSchema::from_declarations(declarations)
+        .map_err(ValidationError::from)?;
+    Ok(Some(schema))
 }
 
-fn validate_mount_names_are_unique(mounts: Vec<(String, ModuleDef)>) -> Result<IndexMap<String, ModuleDef>> {
+/// The canonical form of a submodule namespace: the explicit name if one was given,
+/// otherwise the source name with the parent's case conversion policy applied.
+/// This mirrors how table and function names are resolved.
+fn resolve_namespace_ident(
+    source: &RawIdentifier,
+    case_policy: ValidationCase,
+    explicit_names: &ExplicitNamesLookup,
+) -> Result<Identifier> {
+    let canonical = match explicit_names.namespaces.get(source) {
+        Some(canonical) => canonical.clone(),
+        None => convert(source.clone(), case_policy).into(),
+    };
+    Identifier::new(canonical).map_err(|error| ValidationError::IdentifierError { error }.into())
+}
+
+/// Validate that each submodule's namespace is a valid identifier of at most 63 characters
+/// in both its accessor and canonical forms, that no two submodules share the same canonical
+/// namespace, and that no submodule declares lifecycle reducers (lifecycle reducers are only
+/// permitted in the root module).
+/// This function will inspect each sub-submodule and recursively collect errors.
+///
+/// The returned map is keyed by canonical namespace; each def's `accessor_path` is seeded
+/// with the accessor namespace it was mounted under, to be completed by `apply_namespace`.
+fn validate_submodules(
+    submodules: Vec<RawSubmoduleV10>,
+    case_policy: ValidationCase,
+    explicit_names: &ExplicitNamesLookup,
+) -> Result<IndexMap<Identifier, ModuleDef>> {
     let mut errors = vec![];
-    let mut map = IndexMap::with_capacity(mounts.len());
+    let mut map = IndexMap::with_capacity(submodules.len());
+    let mut accessors = std::collections::HashSet::with_capacity(submodules.len());
 
-    for (namespace, def) in mounts {
-        if map.contains_key(&namespace) {
-            errors.push(ValidationError::DuplicateName { name: namespace.into() });
+    for submodule in submodules {
+        let source = RawIdentifier::from(submodule.namespace.clone());
+        let accessor = match Identifier::new(source.clone()) {
+            Ok(accessor) => accessor,
+            Err(error) => {
+                errors.push(ValidationError::IdentifierError { error });
+                continue;
+            }
+        };
+        let namespace = match resolve_namespace_ident(&source, case_policy, explicit_names) {
+            Ok(namespace) => namespace,
+            Err(e) => {
+                errors.extend(e);
+                continue;
+            }
+        };
+
+        let mut too_long = false;
+        let mut checked: Vec<&Identifier> = vec![&accessor];
+        if namespace != accessor {
+            checked.push(&namespace);
+        }
+        for name in checked {
+            if name.len() > 63 {
+                errors.push(ValidationError::NamespaceTooLong {
+                    namespace: name.as_raw().clone(),
+                    len: name.len(),
+                });
+                too_long = true;
+            }
+        }
+        if too_long {
+            continue;
+        }
+
+        if !accessors.insert(accessor.clone()) {
+            errors.push(ValidationError::DuplicateName {
+                name: accessor.as_raw().clone(),
+            });
+        } else if map.contains_key(&namespace) {
+            errors.push(ValidationError::DuplicateName {
+                name: namespace.as_raw().clone(),
+            });
         } else {
-            map.insert(namespace, def);
+            match validate(submodule.module) {
+                Ok(mut def) => {
+                    if !def.environment().is_empty() {
+                        errors.push(ValidationError::EnvironmentInSubmodule {
+                            namespace: submodule.namespace.clone(),
+                        });
+                    }
+                    for (lifecycle, opt_id) in def.lifecycle_reducers_map() {
+                        if opt_id.is_some() {
+                            errors.push(ValidationError::LifecycleInSubmodule {
+                                lifecycle,
+                                namespace: submodule.namespace.clone(),
+                            });
+                        }
+                    }
+                    def.accessor_path = NamespacePath::root().child(accessor);
+                    map.insert(namespace, def);
+                }
+                Err(e) => errors.extend(e),
+            }
         }
     }
 
     ValidationErrors::add_extra_errors(Ok(map), errors)
+}
+
+/// Reject any table, view, reducer or procedure whose accessor name is also the accessor
+/// name of a submodule mounted in this module.
+///
+/// Generated client bindings expose both under the same key (`conn.reducers.auth` for the
+/// reducer, `conn.reducers.auth.login` for the namespace), so one would shadow the other.
+/// Only accessor names can collide this way. Canonical names can't. On the wire a function
+/// `auth` and a namespace's functions `auth.*` are distinct, and `validate_submodules` already
+/// rejects two namespaces with the same canonical name.
+///
+/// `validate` runs this at every level of the module tree, so a submodule's own functions
+/// are checked against the namespaces it mounts in turn.
+fn check_names_do_not_conflict_with_namespaces(
+    tables: &IdentifierMap<TableDef>,
+    reducers: &IndexMap<Identifier, ReducerDef>,
+    procedures: &IndexMap<Identifier, ProcedureDef>,
+    views: &IndexMap<Identifier, ViewDef>,
+    submodules: &IndexMap<Identifier, ModuleDef>,
+) -> Result<()> {
+    let namespaces: HashMap<&str, &Identifier> = submodules
+        .values()
+        .filter_map(|submodule| submodule.mount_accessor_name())
+        .map(|accessor| (&**accessor, accessor))
+        .collect();
+    if namespaces.is_empty() {
+        return Ok(());
+    }
+
+    let mut errors = vec![];
+    let mut check = |kind: &'static str, accessor_name: &Identifier| {
+        if let Some(namespace) = namespaces.get(&**accessor_name) {
+            errors.push(ValidationError::NamespaceNameConflict {
+                kind,
+                name: accessor_name.as_raw().clone(),
+                namespace: namespace.as_raw().clone(),
+            });
+        }
+    };
+    for table in tables.values() {
+        check("table", &table.accessor_name);
+    }
+    for view in views.values() {
+        check("view", &view.accessor_name);
+    }
+    for reducer in reducers.values() {
+        check("reducer", reducer.accessor_name.local());
+    }
+    for procedure in procedures.values() {
+        check("procedure", &procedure.accessor_name);
+    }
+
+    ValidationErrors::add_extra_errors(Ok(()), errors)
 }
 
 /// Change the visibility of scheduled functions and lifecycle reducers to Internal.
@@ -359,6 +580,53 @@ fn change_scheduled_functions_and_lifetimes_visibility(
     }
 
     Ok(())
+}
+
+fn validate_http_route_path(path: &RawIdentifier) -> Result<()> {
+    let path_str = path.as_ref();
+    if (!path_str.is_empty() && !path_str.starts_with('/'))
+        || !path_str.chars().all(character_is_acceptable_for_route_path)
+    {
+        return Err(ValidationError::InvalidHttpRoutePath { path: path.clone() }.into());
+    }
+    Ok(())
+}
+
+fn routes_overlap(a: &HttpRouteDef, b: &HttpRouteDef) -> bool {
+    if a.path != b.path {
+        return false;
+    }
+    matches!(a.method, MethodOrAny::Any) || matches!(b.method, MethodOrAny::Any) || a.method == b.method
+}
+
+fn validate_http_routes_are_unique(routes: &[HttpRouteDef]) -> Result<()> {
+    let mut errors = Vec::new();
+    for (idx, route) in routes.iter().enumerate() {
+        if routes.iter().take(idx).any(|existing| routes_overlap(existing, route)) {
+            errors.push(ValidationError::DuplicateHttpRoute {
+                path: RawIdentifier::new(route.path.as_ref()),
+                method: route.method.clone(),
+            });
+        }
+    }
+    ErrorStream::add_extra_errors(Ok(()), errors)
+}
+
+fn check_http_handler_names_are_unique(
+    handlers: Vec<(Identifier, HttpHandlerDef)>,
+) -> Result<IndexMap<Identifier, HttpHandlerDef>> {
+    let mut errors = vec![];
+    let mut handlers_map = IndexMap::with_capacity(handlers.len());
+
+    for (name, def) in handlers {
+        if handlers_map.contains_key(&name) {
+            errors.push(ValidationError::DuplicateHttpHandlerName { name });
+        } else {
+            handlers_map.insert(name, def);
+        }
+    }
+
+    ErrorStream::add_extra_errors(Ok(handlers_map), errors)
 }
 
 struct ModuleValidatorV10<'a> {
@@ -535,8 +803,11 @@ impl<'a> ModuleValidatorV10<'a> {
         )
             .combine_errors()?;
 
+        let name = identifier(name)?;
         Ok(TableDef {
-            name: identifier(name)?,
+            // Set by `ModuleDef::apply_namespace` once the module tree is assembled.
+            namespace: NamespacePath::root(),
+            name,
             product_type_ref,
             primary_key,
             columns,
@@ -548,6 +819,7 @@ impl<'a> ModuleValidatorV10<'a> {
             table_access,
             is_event,
             accessor_name: identifier(raw_table_name)?,
+            outbox: None,
         })
     }
 
@@ -707,6 +979,46 @@ impl<'a> ModuleValidatorV10<'a> {
         })
     }
 
+    fn validate_http_handler_def(&mut self, handler_def: RawHttpHandlerDefV10) -> Result<HttpHandlerDef> {
+        let RawHttpHandlerDefV10 { source_name, .. } = handler_def;
+        let accessor_name = identifier(source_name.clone());
+        let name_result = self.core.resolve_function_ident(source_name);
+        let (name_result, accessor_name) = (name_result, accessor_name).combine_errors()?;
+        Ok(HttpHandlerDef {
+            name: name_result,
+            accessor_name,
+        })
+    }
+
+    fn validate_http_route_def(
+        &mut self,
+        route_def: RawHttpRouteDefV10,
+        handlers: &IndexMap<Identifier, HttpHandlerDef>,
+    ) -> Result<HttpRouteDef> {
+        let RawHttpRouteDefV10 {
+            handler_function,
+            method,
+            path,
+            ..
+        } = route_def;
+
+        validate_http_route_path(&path)?;
+
+        let handler_name = self.core.resolve_function_ident(handler_function.clone())?;
+        if !handlers.contains_key(&handler_name) {
+            return Err(ValidationError::MissingHttpHandler {
+                handler: handler_function,
+            }
+            .into());
+        }
+
+        Ok(HttpRouteDef {
+            handler_name,
+            method,
+            path: path.as_ref().into(),
+        })
+    }
+
     fn validate_view_def(&mut self, view_def: RawViewDefV10, typespace_with_accessor: &Typespace) -> Result<ViewDef> {
         let RawViewDefV10 {
             source_name: accessor_name,
@@ -795,10 +1107,26 @@ impl<'a> ModuleValidatorV10<'a> {
             .map(|id| view_validator.validate_param_column_def(id.into()))
             .collect_all_errors();
 
-        let (return_type_for_generate, return_columns, param_columns) =
-            (return_type_for_generate, return_columns, param_columns).combine_errors()?;
+        // Float params are disallowed for now, see `ValidationError::ViewFloatParam`.
+        let float_params = params
+            .elements
+            .iter()
+            .enumerate()
+            .filter(|(_, param)| param.algebraic_type.is_float())
+            .map(|(pos, param)| {
+                Err(ValidationError::ViewFloatParam {
+                    view: accessor_name.clone(),
+                    param: param.name.clone().unwrap_or_else(|| pos.to_string().into()),
+                }
+                .into())
+            })
+            .collect_all_errors::<()>();
+
+        let (return_type_for_generate, return_columns, param_columns, ()) =
+            (return_type_for_generate, return_columns, param_columns, float_params).combine_errors()?;
 
         Ok(ViewDef {
+            namespace: NamespacePath::root(),
             name,
             accessor_name: identifier(accessor_name)?,
             is_anonymous,
@@ -862,10 +1190,250 @@ fn attach_schedules_to_tables(
             .into());
         }
 
+        if table.is_event {
+            return Err(ValidationError::ScheduledEventTable {
+                table: table.name.clone(),
+            }
+            .into());
+        }
+
         table.schedule = Some(schedule);
     }
 
     Ok(())
+}
+
+fn attach_outboxes_to_tables(
+    tables: &mut HashMap<Identifier, TableDef>,
+    reducers: &mut IndexMap<Identifier, ReducerDef>,
+    outboxes: Vec<RawOutboxDefV10>,
+    core: &mut CoreValidator<'_>,
+) -> Result<()> {
+    for outbox in outboxes {
+        let RawOutboxDefV10 {
+            table_name: table_source_name,
+            remote_reducer,
+            target_column,
+            arg_columns,
+            on_result_reducer,
+            signature_hash,
+        } = outbox;
+
+        let table = tables
+            .values_mut()
+            .find(|table| table.accessor_name.as_raw() == &table_source_name)
+            .ok_or_else(|| ValidationError::MissingOutboxTable {
+                table_name: table_source_name.clone(),
+            })?;
+
+        if table.outbox.is_some() {
+            return Err(ValidationError::DuplicateOutbox {
+                table: table.name.clone(),
+            }
+            .into());
+        }
+        if table.is_event {
+            return Err(ValidationError::OutboxEventTable {
+                table: table.name.clone(),
+            }
+            .into());
+        }
+        if table.schedule.is_some() {
+            return Err(ValidationError::OutboxScheduledTable {
+                table: table.name.clone(),
+            }
+            .into());
+        }
+
+        let primary_key = table
+            .primary_key
+            .ok_or_else(|| ValidationError::OutboxMissingPrimaryKey {
+                table: table.name.clone(),
+            })?;
+        let primary_key_ty = &table.columns[primary_key.idx()].ty;
+        if *primary_key_ty != AlgebraicType::U64 {
+            return Err(ValidationError::OutboxInvalidPrimaryKey {
+                table: table.name.clone(),
+                found: primary_key_ty.clone().into(),
+            }
+            .into());
+        }
+
+        let Some(target_col) = table.columns.get(target_column.idx()) else {
+            return Err(ValidationError::OutboxTargetColumnMissing {
+                table: table.name.clone(),
+            }
+            .into());
+        };
+        if target_col.col_id == primary_key || !(target_col.ty == AlgebraicType::U256 || target_col.ty.is_identity()) {
+            return Err(ValidationError::OutboxTargetColumnMissing {
+                table: table.name.clone(),
+            }
+            .into());
+        }
+
+        for arg_column in &arg_columns {
+            if table.columns.get(arg_column.idx()).is_none() {
+                return Err(ValidationError::OutboxArgumentColumnNotFound {
+                    table: table.name.clone(),
+                    column: *arg_column,
+                }
+                .into());
+            }
+        }
+
+        let on_result_reducer = on_result_reducer
+            .map(|name| {
+                if name.contains('.') || name.contains("::") {
+                    return Err(ValidationError::OutboxOnResultMustBeLocal {
+                        table: table.name.clone(),
+                        reducer_name: name,
+                    }
+                    .into());
+                }
+                let raw_name = name.clone();
+                let name = core.resolve_function_ident(name)?;
+                if let Some(reducer) = reducers.get_mut(&name) {
+                    let result_type = AlgebraicType::result(AlgebraicType::unit(), AlgebraicType::String);
+                    let valid_params = match &*reducer.params.elements {
+                        [row, result] => {
+                            row.algebraic_type == AlgebraicType::Ref(table.product_type_ref)
+                                && core
+                                    .typespace
+                                    .with_type(&result.algebraic_type)
+                                    .resolve_refs()
+                                    .is_ok_and(|ty| ty == result_type)
+                        }
+                        _ => false,
+                    };
+                    if !valid_params {
+                        return Err(ValidationError::IncorrectOutboxOnResultParams {
+                            table: table.name.clone(),
+                            reducer_name: raw_name,
+                            expected: AlgebraicType::product([AlgebraicType::Ref(table.product_type_ref), result_type])
+                                .into(),
+                            actual: reducer.params.clone().into(),
+                        }
+                        .into());
+                    }
+                    reducer.visibility = crate::def::FunctionVisibility::Private;
+                    Ok::<_, ValidationErrors>(name)
+                } else {
+                    Err(ValidationError::MissingOutboxOnResult {
+                        table: table.name.clone(),
+                        reducer_name: raw_name,
+                    }
+                    .into())
+                }
+            })
+            .transpose()?;
+
+        table.outbox = Some(OutboxDef {
+            remote_reducer: ReducerName::new(
+                NamespacedIdentifier::new(&RawNamespacedIdentifier::new(remote_reducer.into_inner()))
+                    .map_err(|error| ValidationError::IdentifierError { error })?,
+            ),
+            target_column,
+            arg_columns,
+            on_result_reducer: on_result_reducer.map(ReducerName::new),
+            signature_hash,
+        });
+    }
+
+    Ok(())
+}
+
+/// Attach explicit view primary-key metadata from the raw V10 `ViewPrimaryKeys`
+/// section to validated [`ViewDef`]s.
+///
+/// Entries in the raw section refer to view and column source/accessor names,
+/// not canonical names. This resolves those names against the already validated
+/// views, checks the current single-column restriction, and stores the resolved
+/// [`ColId`] on `ViewDef::primary_key`.
+fn attach_view_primary_keys(
+    views: &mut IndexMap<Identifier, ViewDef>,
+    primary_keys: Vec<RawViewPrimaryKeyDefV10>,
+) -> Result<()> {
+    let mut errors = Vec::new();
+    let mut seen = Vec::new();
+
+    // `ViewPrimaryKeys` is a separate V10 section keyed by view source/accessor
+    // name. Validation happens after all views have been built so that we can
+    // resolve each entry against the validated `ViewDef` and its validated return
+    // columns.
+    for primary_key in primary_keys {
+        let RawViewPrimaryKeyDefV10 {
+            view_source_name,
+            columns,
+        } = primary_key;
+
+        // Keep one primary-key declaration per view. Multiple section entries
+        // for the same view are treated as a schema error rather than merged so
+        // typos or duplicate module def output do not silently change behavior.
+        if seen.contains(&view_source_name) {
+            errors.push(ValidationError::RepeatedViewPrimaryKey {
+                view: view_source_name.clone(),
+            });
+            continue;
+        }
+        seen.push(view_source_name.clone());
+
+        // The raw ABI stores a vector so multi-column keys can be added later
+        // without changing the section shape. The current schema model and
+        // client caches only support a single view primary-key column.
+        if columns.len() > 1 {
+            errors.push(ValidationError::MultipleViewPrimaryKeyColumns {
+                view: view_source_name.clone(),
+                columns,
+            });
+            continue;
+        }
+
+        let Some(column_name) = columns.into_iter().next() else {
+            continue;
+        };
+
+        // Match the view by accessor/source name because this is raw
+        // module-definition metadata produced before validation applies case
+        // conversion and explicit-name resolution. The canonical view name may
+        // differ from the source name.
+        let Some(view) = views
+            .values_mut()
+            .find(|view| view.accessor_name.as_raw() == &view_source_name)
+        else {
+            errors.push(ValidationError::ViewPrimaryKeyViewNotFound { view: view_source_name });
+            continue;
+        };
+
+        // Rows from every instance of a parameterized view share one client
+        // cache, so the same key can arrive from more than one instance.
+        if !view.params.elements.is_empty() {
+            errors.push(ValidationError::ViewPrimaryKeyWithParams { view: view_source_name });
+            continue;
+        }
+
+        // Match return columns by accessor/source name for the same reason. For
+        // raw schemas produced from a validated `ModuleDef`, the accessor name
+        // may already be canonical; in both cases it must agree with the return
+        // type names present in that raw schema.
+        let Some(column) = view
+            .return_columns
+            .iter()
+            .find(|column| column.accessor_name.as_raw() == &column_name)
+        else {
+            errors.push(ValidationError::ViewPrimaryKeyColumnNotFound {
+                view: view_source_name,
+                column: column_name,
+            });
+            continue;
+        };
+
+        // Store the resolved column id on the canonical view definition. Later
+        // schema construction and codegen use this just like a table primary key.
+        view.primary_key = Some(column.col_id);
+    }
+
+    ValidationErrors::add_extra_errors(Ok(()), errors)
 }
 
 fn assign_query_view_primary_keys(tables: &IdentifierMap<TableDef>, views: &mut IndexMap<Identifier, ViewDef>) {
@@ -892,9 +1460,13 @@ fn assign_query_view_primary_keys(tables: &IdentifierMap<TableDef>, views: &mut 
 
     for view in views.values_mut() {
         view.primary_key = match extract_view_return_product_type_ref(&view.return_type) {
-            Some((_, ViewKind::Procedural)) => None,
-            Some((product_type_ref, ViewKind::Query)) => primary_key_for_product_type_ref(product_type_ref),
-            None => None,
+            Some((_, ViewKind::Procedural)) => view.primary_key,
+            // Parameterized views don't inherit one, see `attach_view_primary_keys`.
+            Some((_, ViewKind::Query)) if !view.params.elements.is_empty() => view.primary_key,
+            Some((product_type_ref, ViewKind::Query)) => view
+                .primary_key
+                .or_else(|| primary_key_for_product_type_ref(product_type_ref)),
+            None => view.primary_key,
         };
     }
 }
@@ -911,15 +1483,21 @@ mod tests {
     };
     use crate::error::*;
     use crate::identifier::Identifier;
+    use crate::identifier::NamespacePath;
+    use crate::reducer_name::ReducerName;
     use crate::type_for_generate::ClientCodegenError;
 
     use itertools::Itertools;
     use spacetimedb_data_structures::expect_error_matching;
     use spacetimedb_lib::db::raw_def::v10::{
-        CaseConversionPolicy, RawModuleDefV10, RawModuleDefV10Builder, RawModuleDefV10Section, RawModuleMountV10,
+        CaseConversionPolicy, ExplicitNames, MethodOrAny, RawModuleDefV10, RawModuleDefV10Builder,
+        RawModuleDefV10Section, RawSubmoduleV10,
     };
     use spacetimedb_lib::db::raw_def::v9::{btree, direct, hash};
     use spacetimedb_lib::db::raw_def::*;
+    use spacetimedb_lib::db::view::QUERY_VIEW_RETURN_TAG;
+    use spacetimedb_lib::hash_bytes;
+    use spacetimedb_lib::http::Method as HttpMethod;
     use spacetimedb_lib::ScheduleAt;
     use spacetimedb_primitives::{ColId, ColList, ColSet};
     use spacetimedb_sats::raw_identifier::RawIdentifier;
@@ -1073,6 +1651,8 @@ mod tests {
             [
                 &IndexDef {
                     name: "apples_apple_name_count_fresh_idx_btree".into(),
+
+                    namespace: NamespacePath::root(),
                     source_name: "apples_id".into(),
                     accessor_name: None,
                     algorithm: BTreeAlgorithm {
@@ -1082,12 +1662,16 @@ mod tests {
                 },
                 &IndexDef {
                     name: "apples_count_fresh_idx_direct".into(),
+
+                    namespace: NamespacePath::root(),
                     accessor_name: None,
                     source_name: "Apples_count_direct".into(),
                     algorithm: DirectAlgorithm { column: ColId(2) }.into()
                 },
                 &IndexDef {
                     name: "apples_type_idx_btree".into(),
+
+                    namespace: NamespacePath::root(),
                     source_name: "Apples_type_btree".into(),
                     accessor_name: None,
                     algorithm: BTreeAlgorithm {
@@ -1214,6 +1798,83 @@ mod tests {
     }
 
     #[test]
+    fn outbox_flows_from_module_def_to_table_schema() {
+        use crate::schema::{Schema, TableSchema};
+        use spacetimedb_primitives::TableId;
+
+        let mut builder = RawModuleDefV10Builder::new();
+        builder
+            .build_table_with_new_type(
+                "outbound_pings",
+                ProductType::from([
+                    ("msg_id", AlgebraicType::U64),
+                    ("target", AlgebraicType::identity()),
+                    ("payload", AlgebraicType::String),
+                ]),
+                true,
+            )
+            .with_auto_inc_primary_key(0)
+            .with_index_no_accessor_name(direct(0), "outbound_pings_msg_id_idx_btree")
+            .finish();
+        builder.add_reducer("receive_ping", ProductType::from([("payload", AlgebraicType::String)]));
+        let signature_hash = hash_bytes(b"test-signature");
+        builder.add_outbox(
+            "outbound_pings",
+            "receive_ping",
+            ColId(1),
+            [ColId(2)],
+            Option::<&str>::None,
+            signature_hash,
+        );
+
+        let module: ModuleDef = builder.finish().try_into().expect("valid outbox module");
+        let table = module.table("outbound_pings").expect("outbox table exists");
+        let outbox = table.outbox.as_ref().expect("TableDef carries outbox metadata");
+        assert_eq!(&outbox.remote_reducer[..], "receive_ping");
+        assert_eq!(outbox.target_column, ColId(1));
+        assert_eq!(outbox.arg_columns, vec![ColId(2)]);
+        assert_eq!(outbox.signature_hash, signature_hash);
+
+        let schema = TableSchema::from_module_def(&module, table, (), TableId::SENTINEL);
+        let outbox = schema.outbox.expect("TableSchema carries outbox metadata");
+        assert_eq!(&outbox.remote_reducer[..], "receive_ping");
+        assert_eq!(outbox.target_column, ColId(1));
+    }
+
+    #[test]
+    fn outbox_rejects_event_table() {
+        let mut builder = RawModuleDefV10Builder::new();
+        builder
+            .build_table_with_new_type(
+                "outbound_pings",
+                ProductType::from([
+                    ("msg_id", AlgebraicType::U64),
+                    ("target", AlgebraicType::identity()),
+                    ("payload", AlgebraicType::String),
+                ]),
+                true,
+            )
+            .with_event(true)
+            .with_auto_inc_primary_key(0)
+            .with_index_no_accessor_name(direct(0), "outbound_pings_msg_id_idx_btree")
+            .finish();
+        builder.add_reducer("receive_ping", ProductType::from([("payload", AlgebraicType::String)]));
+        builder.add_outbox(
+            "outbound_pings",
+            "receive_ping",
+            ColId(1),
+            [ColId(2)],
+            Option::<&str>::None,
+            spacetimedb_lib::hash_bytes(b"test-signature"),
+        );
+
+        let result: Result<ModuleDef> = builder.finish().try_into();
+        expect_error_matching!(result, ValidationError::OutboxEventTable { table } => {
+            table == &expect_identifier("outbound_pings")
+        });
+    }
+
+    #[test]
     fn invalid_product_type_ref() {
         let mut builder = RawModuleDefV10Builder::new();
 
@@ -1297,32 +1958,349 @@ mod tests {
         });
     }
 
+    /// Defs in a submodule must carry namespace-qualified keys, and `lookup` must round-trip
+    /// through them. Nesting resolves at whichever level ends up outermost.
     #[test]
-    fn validates_mounted_submodules_recursively() {
-        let mut mounted_builder = RawModuleDefV10Builder::new();
-        mounted_builder
+    fn submodule_defs_have_namespaced_keys() {
+        use crate::def::{ModuleDefLookup, TableDef};
+
+        let mut inner = RawModuleDefV10Builder::new();
+        inner
+            .build_table_with_new_type("sessions", ProductType::from([("id", AlgebraicType::U64)]), true)
+            .finish();
+
+        let mut middle = RawModuleDefV10Builder::new().finish();
+        middle
+            .sections
+            .push(RawModuleDefV10Section::Submodules(vec![RawSubmoduleV10 {
+                namespace: "inner".to_string(),
+                module: inner.finish(),
+            }]));
+
+        let mut root = RawModuleDefV10Builder::new().finish();
+        root.sections
+            .push(RawModuleDefV10Section::Submodules(vec![RawSubmoduleV10 {
+                namespace: "outer".to_string(),
+                module: middle,
+            }]));
+
+        let def: ModuleDef = root.try_into().expect("should validate");
+
+        let (_, _, table) = def
+            .all_tables_with_prefix()
+            .into_iter()
+            .next()
+            .expect("nested submodule table should exist");
+
+        // The recorded namespace is the full mount path, not just the innermost segment,
+        // and the local name is untouched.
+        assert_eq!(table.namespace.to_string(), "outer.inner.");
+        assert_eq!(&*table.name, "sessions");
+        // The joined form is built on demand from the two.
+        assert_eq!(&*table.namespace.join(table.name.clone()), "outer.inner.sessions");
+
+        // And the key round-trips through `lookup` from the root.
+        let found = <TableDef as ModuleDefLookup>::lookup(&def, table.key()).expect("lookup by key");
+        assert_eq!(found.key(), table.key());
+
+        // A namespace that does not resolve to a real mount yields nothing.
+        let bogus = NamespacePath::root()
+            .child(Identifier::for_test("outer"))
+            .child(Identifier::for_test("nope"));
+        assert!(<TableDef as ModuleDefLookup>::lookup(&def, (&bogus, &table.name)).is_none());
+    }
+
+    #[test]
+    fn validates_submodules_recursively() {
+        let mut submodule_builder = RawModuleDefV10Builder::new();
+        submodule_builder
             .build_table_with_new_type("Sessions", ProductType::from([("id", AlgebraicType::U64)]), true)
             .finish();
 
         let raw = RawModuleDefV10 {
-            sections: vec![RawModuleDefV10Section::Mounts(vec![RawModuleMountV10 {
+            sections: vec![RawModuleDefV10Section::Submodules(vec![RawSubmoduleV10 {
                 namespace: "authlib".to_string(),
-                module: mounted_builder.finish(),
+                module: submodule_builder.finish(),
             }])],
         };
 
-        let def: ModuleDef = raw.try_into().expect("mounted module should validate");
-        let mounts = def.mounts();
+        let def: ModuleDef = raw.try_into().expect("submodule should validate");
+        let submodules = def.submodules();
 
-        assert_eq!(mounts.len(), 1);
-        let mounted = mounts.get("authlib").expect("authlib mount should exist");
-        assert!(mounted.table(&expect_identifier("sessions")).is_some());
+        assert_eq!(submodules.len(), 1);
+        let submodule = submodules.get("authlib").expect("authlib submodule should exist");
+        assert!(submodule.table(&expect_identifier("sessions")).is_some());
+    }
+
+    fn sessions_submodule() -> RawModuleDefV10 {
+        let mut sub = RawModuleDefV10Builder::new();
+        sub.build_table_with_new_type("sessions", ProductType::from([("id", AlgebraicType::U64)]), true)
+            .finish();
+        sub.add_reducer("cleanExpiredSessions", ProductType::unit());
+        sub.finish()
+    }
+
+    /// The key a submodule is mounted under is its accessor namespace. Its canonical
+    /// namespace follows the parent's case conversion policy, exactly like a table name.
+    #[test]
+    fn submodule_namespace_is_case_converted() {
+        let mut root = RawModuleDefV10Builder::new();
+        root.add_submodule("myAuth", sessions_submodule());
+        let def: ModuleDef = root.finish().try_into().expect("submodule should validate");
+
+        assert!(
+            def.submodules().get("myAuth").is_none(),
+            "accessor name must not be the key"
+        );
+        let sub = def
+            .submodules()
+            .get("my_auth")
+            .expect("submodule should be keyed by its snake_case canonical namespace");
+        assert_eq!(sub.mount_accessor_name().map(|n| &**n), Some("myAuth"));
+        assert_eq!(sub.path().to_string(), "my_auth.");
+        assert_eq!(sub.accessor_path().to_string(), "myAuth.");
+
+        // Every def under it is keyed by the canonical path, while its alias uses the accessor path.
+        let (prefix, owning, table) = def.all_tables_with_prefix().into_iter().next().expect("table");
+        assert_eq!(prefix.to_string(), "my_auth.");
+        assert_eq!(&*prefix.join(table.name.clone()), "my_auth.sessions");
+        assert_eq!(
+            &*owning.accessor_path().join(table.accessor_name.clone()),
+            "myAuth.sessions"
+        );
+
+        assert!(def.reducer_by_name("my_auth.clean_expired_sessions").is_some());
+        assert!(def.reducer_by_name("myAuth.clean_expired_sessions").is_none());
+    }
+
+    /// An explicit namespace name is stored verbatim, bypassing the case conversion policy.
+    /// This is the escape hatch for modules that published a camelCase namespace before
+    /// namespaces were case-converted.
+    #[test]
+    fn submodule_namespace_explicit_name_overrides_policy() {
+        let mut root = RawModuleDefV10Builder::new();
+        root.add_submodule("myAuth", sessions_submodule());
+        let mut explicit = ExplicitNames::default();
+        explicit.insert_namespace("myAuth", "myAuth");
+        root.add_explicit_names(explicit);
+        let def: ModuleDef = root.finish().try_into().expect("submodule should validate");
+
+        assert!(def.submodules().get("my_auth").is_none());
+        let sub = def.submodules().get("myAuth").expect("explicit canonical namespace");
+        assert_eq!(sub.mount_accessor_name().map(|n| &**n), Some("myAuth"));
+        assert_eq!(sub.path().to_string(), "myAuth.");
+        assert_eq!(sub.accessor_path().to_string(), "myAuth.");
+        assert!(def.reducer_by_name("myAuth.clean_expired_sessions").is_some());
+
+        // The explicit name need not resemble the accessor at all.
+        let mut root = RawModuleDefV10Builder::new();
+        root.add_submodule("myAuth", sessions_submodule());
+        let mut explicit = ExplicitNames::default();
+        explicit.insert_namespace("myAuth", "AuthLib");
+        root.add_explicit_names(explicit);
+        let def: ModuleDef = root.finish().try_into().expect("submodule should validate");
+        let sub = def.submodules().get("AuthLib").expect("explicit canonical namespace");
+        assert_eq!(sub.mount_accessor_name().map(|n| &**n), Some("myAuth"));
+        assert_eq!(sub.accessor_path().to_string(), "myAuth.");
+    }
+
+    /// Explicit namespace names are validated like any other identifier.
+    #[test]
+    fn submodule_namespace_explicit_name_must_be_valid() {
+        let mut root = RawModuleDefV10Builder::new();
+        root.add_submodule("myAuth", sessions_submodule());
+        let mut explicit = ExplicitNames::default();
+        explicit.insert_namespace("myAuth", "");
+        root.add_explicit_names(explicit);
+        let result: Result<ModuleDef> = root.finish().try_into();
+
+        expect_error_matching!(result, ValidationError::IdentifierError { error } => {
+            error == &IdentifierError::Empty {}
+        });
+    }
+
+    /// `CaseConversionPolicy::None` keeps namespaces verbatim, like every other name.
+    #[test]
+    fn submodule_namespace_none_policy_keeps_source_name() {
+        let mut root = RawModuleDefV10Builder::new();
+        root.set_case_conversion_policy(CaseConversionPolicy::None);
+        root.add_submodule("myAuth", sessions_submodule());
+        let def: ModuleDef = root.finish().try_into().expect("submodule should validate");
+
+        let sub = def.submodules().get("myAuth").expect("verbatim canonical namespace");
+        assert_eq!(sub.mount_accessor_name().map(|n| &**n), Some("myAuth"));
+        assert_eq!(sub.path().to_string(), "myAuth.");
     }
 
     #[test]
-    fn invalid_mount_namespace() {
+    fn duplicate_submodule_accessor_namespaces_are_rejected() {
+        let mut root = RawModuleDefV10Builder::new();
+        root.add_submodule("myAuth", sessions_submodule());
+        root.add_submodule("myAuth", sessions_submodule());
+        let result: Result<ModuleDef> = root.finish().try_into();
+
+        expect_error_matching!(result, ValidationError::DuplicateName { name } => {
+            &name[..] == "myAuth"
+        });
+    }
+
+    /// Two accessor namespaces that canonicalize to the same name are a duplicate.
+    #[test]
+    fn submodule_namespaces_colliding_after_conversion_are_rejected() {
+        let mut root = RawModuleDefV10Builder::new();
+        root.add_submodule("myAuth", sessions_submodule());
+        root.add_submodule("my_auth", sessions_submodule());
+        let result: Result<ModuleDef> = root.finish().try_into();
+
+        expect_error_matching!(result, ValidationError::DuplicateName { name } => {
+            &name[..] == "my_auth"
+        });
+    }
+
+    /// A function or table cannot share its accessor name with a namespace mounted beside it,
+    /// since generated client bindings would expose both under the same key.
+    #[test]
+    fn names_conflicting_with_submodule_namespaces_are_rejected() {
+        let conflict = |kind: &str, result: Result<ModuleDef>| {
+            expect_error_matching!(
+                result,
+                ValidationError::NamespaceNameConflict { kind: k, name, namespace } => {
+                    *k == kind && &name[..] == "auth" && &namespace[..] == "auth"
+                }
+            );
+        };
+
+        let mut root = RawModuleDefV10Builder::new();
+        root.add_submodule("auth", sessions_submodule());
+        root.add_reducer("auth", ProductType::unit());
+        conflict("reducer", root.finish().try_into());
+
+        let mut root = RawModuleDefV10Builder::new();
+        root.add_submodule("auth", sessions_submodule());
+        root.add_procedure("auth", ProductType::unit(), AlgebraicType::unit());
+        conflict("procedure", root.finish().try_into());
+
+        let mut root = RawModuleDefV10Builder::new();
+        root.add_submodule("auth", sessions_submodule());
+        let row = root.add_algebraic_type([], "Row", AlgebraicType::product([("id", AlgebraicType::U64)]), true);
+        root.add_view(
+            "auth",
+            0,
+            true,
+            true,
+            ProductType::unit(),
+            AlgebraicType::array(AlgebraicType::Ref(row)),
+        );
+        conflict("view", root.finish().try_into());
+
+        let mut root = RawModuleDefV10Builder::new();
+        root.add_submodule("auth", sessions_submodule());
+        root.build_table_with_new_type("auth", ProductType::from([("id", AlgebraicType::U64)]), true)
+            .finish();
+        conflict("table", root.finish().try_into());
+    }
+
+    /// The conflict is on accessor names. A function whose canonical name happens to match a
+    /// namespace's canonical name is fine: the two are distinct on the wire.
+    #[test]
+    fn canonical_names_matching_a_namespace_are_allowed() {
+        // Reducer `myAuth` canonicalizes to `my_auth`, which is also the canonical form of the
+        // `authLib` namespace once pinned, but the accessor names `myAuth` and `authLib` differ.
+        let mut root = RawModuleDefV10Builder::new();
+        root.add_submodule("authLib", sessions_submodule());
+        let mut explicit = ExplicitNames::default();
+        explicit.insert_namespace("authLib", "my_auth");
+        root.add_explicit_names(explicit);
+        root.add_reducer("myAuth", ProductType::unit());
+        let def: ModuleDef = root
+            .finish()
+            .try_into()
+            .expect("canonical name overlap should validate");
+
+        assert!(def.submodules().contains_key("my_auth"));
+        assert!(def.reducer_by_name("my_auth").is_some());
+        assert!(def.reducer_by_name("my_auth.clean_expired_sessions").is_some());
+    }
+
+    /// The check applies at every level: a submodule's own functions are checked against the
+    /// namespaces it mounts.
+    #[test]
+    fn names_conflicting_with_nested_submodule_namespaces_are_rejected() {
+        let mut middle = RawModuleDefV10Builder::new();
+        middle.add_submodule("audit", sessions_submodule());
+        middle.add_reducer("audit", ProductType::unit());
+
+        let mut root = RawModuleDefV10Builder::new();
+        root.add_submodule("auth", middle.finish());
+        let result: Result<ModuleDef> = root.finish().try_into();
+
+        expect_error_matching!(
+            result,
+            ValidationError::NamespaceNameConflict { kind, name, namespace } => {
+                *kind == "reducer" && &name[..] == "audit" && &namespace[..] == "audit"
+            }
+        );
+    }
+
+    /// Nested mounts carry both paths through every level.
+    #[test]
+    fn nested_submodule_namespaces_carry_both_paths() {
+        let mut outer = RawModuleDefV10Builder::new();
+        outer.add_submodule("myInner", sessions_submodule());
+        let mut root = RawModuleDefV10Builder::new();
+        root.add_submodule("myOuter", outer.finish());
+        let def: ModuleDef = root.finish().try_into().expect("submodule should validate");
+
+        let inner = def
+            .submodules()
+            .get("my_outer")
+            .and_then(|outer| outer.submodules().get("my_inner"))
+            .expect("nested submodule keyed by canonical names");
+        assert_eq!(inner.path().to_string(), "my_outer.my_inner.");
+        assert_eq!(inner.accessor_path().to_string(), "myOuter.myInner.");
+
+        let (prefix, owning, table) = def.all_tables_with_prefix().into_iter().next().expect("table");
+        assert_eq!(&*prefix.join(table.name.clone()), "my_outer.my_inner.sessions");
+        assert_eq!(
+            &*owning.accessor_path().join(table.accessor_name.clone()),
+            "myOuter.myInner.sessions"
+        );
+        assert!(def
+            .reducer_by_name("my_outer.my_inner.clean_expired_sessions")
+            .is_some());
+    }
+
+    /// Converting a `ModuleDef` back to a raw def and validating it again must preserve
+    /// both the canonical and the accessor namespace (the CLI does this for `describe`).
+    #[test]
+    fn submodule_namespaces_round_trip_through_raw_def() {
+        let mut root = RawModuleDefV10Builder::new();
+        root.add_submodule("myAuth", sessions_submodule());
+        root.add_submodule("pinned", sessions_submodule());
+        let mut explicit = ExplicitNames::default();
+        explicit.insert_namespace("pinned", "PinnedLib");
+        root.add_explicit_names(explicit);
+        let def: ModuleDef = root.finish().try_into().expect("submodule should validate");
+
+        let raw: RawModuleDefV10 = def.into();
+        let def: ModuleDef = raw.try_into().expect("round-tripped def should validate");
+
+        let keys: Vec<_> = def.submodules().keys().map(|k| k.to_string()).collect();
+        assert_eq!(keys, ["my_auth", "PinnedLib"]);
+        assert_eq!(
+            def.submodules()["my_auth"].mount_accessor_name().map(|n| &**n),
+            Some("myAuth")
+        );
+        assert_eq!(
+            def.submodules()["PinnedLib"].mount_accessor_name().map(|n| &**n),
+            Some("pinned")
+        );
+    }
+
+    #[test]
+    fn invalid_submodule_namespace() {
         let raw = RawModuleDefV10 {
-            sections: vec![RawModuleDefV10Section::Mounts(vec![RawModuleMountV10 {
+            sections: vec![RawModuleDefV10Section::Submodules(vec![RawSubmoduleV10 {
                 namespace: "".to_string(),
                 module: RawModuleDefV10::default(),
             }])],
@@ -1336,14 +2314,14 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_mount_namespace() {
+    fn duplicate_submodule_namespace() {
         let raw = RawModuleDefV10 {
-            sections: vec![RawModuleDefV10Section::Mounts(vec![
-                RawModuleMountV10 {
+            sections: vec![RawModuleDefV10Section::Submodules(vec![
+                RawSubmoduleV10 {
                     namespace: "authlib".to_string(),
                     module: RawModuleDefV10::default(),
                 },
-                RawModuleMountV10 {
+                RawSubmoduleV10 {
                     namespace: "authlib".to_string(),
                     module: RawModuleDefV10::default(),
                 },
@@ -1645,6 +2623,204 @@ mod tests {
         });
     }
 
+    fn outbox_with_on_result() -> RawModuleDefV10Builder {
+        let mut builder = RawModuleDefV10Builder::new();
+        let row_type = builder
+            .build_table_with_new_type(
+                "PingOutbox",
+                ProductType::from([
+                    ("msg_id", AlgebraicType::U64),
+                    ("target", AlgebraicType::U256),
+                    ("payload", AlgebraicType::String),
+                ]),
+                true,
+            )
+            .with_auto_inc_primary_key(0)
+            .with_index_no_accessor_name(direct(0), "ping_outbox_msg_id_idx_btree")
+            .finish();
+        builder.add_reducer(
+            "on_ping_result",
+            ProductType::from([
+                ("row", row_type.into()),
+                (
+                    "result",
+                    AlgebraicType::result(AlgebraicType::unit(), AlgebraicType::String),
+                ),
+            ]),
+        );
+        builder.add_outbox(
+            "PingOutbox",
+            "receive_ping",
+            ColId(1),
+            [ColId(2)],
+            Some("on_ping_result"),
+            hash_bytes(b"receive_ping"),
+        );
+        builder
+    }
+
+    #[test]
+    fn outbox_on_result_reducer_is_attached() {
+        let def: ModuleDef = outbox_with_on_result().finish().try_into().unwrap();
+        let table = &def.tables[&expect_identifier("ping_outbox")];
+        let outbox = table.outbox.as_ref().unwrap();
+
+        assert_eq!(outbox.remote_reducer, ReducerName::for_test("receive_ping"));
+        assert_eq!(outbox.target_column, ColId(1));
+        assert_eq!(outbox.on_result_reducer, Some(ReducerName::for_test("on_ping_result")));
+        assert_eq!(
+            def.reducers[&expect_identifier("on_ping_result")].visibility,
+            FunctionVisibility::Private
+        );
+    }
+
+    #[test]
+    fn outbox_on_result_accepts_referenced_result_and_arbitrary_parameter_names() {
+        let mut builder = outbox_with_on_result();
+        let result_type = builder.add_algebraic_type(
+            [],
+            "DeliveryResult",
+            AlgebraicType::result(AlgebraicType::unit(), AlgebraicType::String),
+            true,
+        );
+        let mut raw = builder.finish();
+        for section in &mut raw.sections {
+            if let RawModuleDefV10Section::Reducers(reducers) = section {
+                reducers[0].params.elements[0].name = Some("message".into());
+                reducers[0].params.elements[1].name = Some("outcome".into());
+                reducers[0].params.elements[1].algebraic_type = result_type.into();
+            }
+        }
+        let def: ModuleDef = raw.try_into().unwrap();
+        assert_eq!(
+            def.reducers[&expect_identifier("on_ping_result")].visibility,
+            FunctionVisibility::Private
+        );
+    }
+
+    #[test]
+    fn outbox_on_result_rejects_invalid_signatures() {
+        let raw = outbox_with_on_result().finish();
+        let row = AlgebraicType::Ref(raw.tables().unwrap()[0].product_type_ref);
+        let result = AlgebraicType::result(AlgebraicType::unit(), AlgebraicType::String);
+        for params in [
+            ProductType::unit(),
+            ProductType::from([("row", row.clone())]),
+            ProductType::from([("row", AlgebraicType::U64), ("result", result.clone())]),
+            ProductType::from([("result", result.clone()), ("row", row.clone())]),
+            ProductType::from([
+                ("row", row.clone()),
+                (
+                    "result",
+                    AlgebraicType::result(AlgebraicType::U64, AlgebraicType::String),
+                ),
+            ]),
+            ProductType::from([
+                ("row", row.clone()),
+                (
+                    "result",
+                    AlgebraicType::result(AlgebraicType::unit(), AlgebraicType::U64),
+                ),
+            ]),
+            ProductType::from([
+                ("row", row.clone()),
+                ("result", AlgebraicType::option(AlgebraicType::String)),
+            ]),
+            ProductType::from([("row", row), ("result", result), ("extra", AlgebraicType::U64)]),
+        ] {
+            let mut invalid = raw.clone();
+            for section in &mut invalid.sections {
+                if let RawModuleDefV10Section::Reducers(reducers) = section {
+                    reducers[0].params = params.clone();
+                }
+            }
+            let result: Result<ModuleDef> = invalid.try_into();
+            expect_error_matching!(result, ValidationError::IncorrectOutboxOnResultParams {
+                table,
+                reducer_name,
+                ..
+            } => {
+                assert_eq!(table, &expect_identifier("ping_outbox"));
+                assert_eq!(&**reducer_name, "on_ping_result");
+                true
+            });
+        }
+    }
+
+    #[test]
+    fn outbox_on_result_rejects_cross_module_callbacks() {
+        for policy in [CaseConversionPolicy::SnakeCase, CaseConversionPolicy::None] {
+            let table_name = if matches!(policy, CaseConversionPolicy::None) {
+                "PingOutbox"
+            } else {
+                "ping_outbox"
+            };
+            for callback in ["child.on_ping_result", "child::on_ping_result"] {
+                let mut child = RawModuleDefV10Builder::new();
+                child.add_reducer("on_ping_result", ProductType::unit());
+                let mut parent = outbox_with_on_result();
+                parent.set_case_conversion_policy(policy);
+                parent.add_reducer("child_on_ping_result", ProductType::unit());
+                let mut names = ExplicitNames::default();
+                names.insert_function(callback, "child_on_ping_result");
+                parent.add_explicit_names(names);
+                parent.add_submodule("child", child.finish());
+                let mut raw = parent.finish();
+                for section in &mut raw.sections {
+                    if let RawModuleDefV10Section::Outboxes(outboxes) = section {
+                        outboxes[0].on_result_reducer = Some(callback.into());
+                    }
+                }
+                let result: Result<ModuleDef> = raw.try_into();
+
+                expect_error_matching!(result, ValidationError::OutboxOnResultMustBeLocal {
+                    table,
+                    reducer_name,
+                } => {
+                    assert_eq!(table, &expect_identifier(table_name));
+                    assert_eq!(&**reducer_name, callback);
+                    true
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn outbox_on_result_uses_canonical_submodule_namespace_and_round_trips() {
+        let mut child = outbox_with_on_result();
+        let mut names = ExplicitNames::default();
+        names.insert_table("PingOutbox", "WireOutbox");
+        names.insert_function("on_ping_result", "ResultDone");
+        child.add_explicit_names(names);
+
+        let mut middle = RawModuleDefV10Builder::new();
+        middle.add_submodule("innerMount", child.finish());
+        let mut names = ExplicitNames::default();
+        names.insert_namespace("innerMount", "InnerWire");
+        middle.add_explicit_names(names);
+
+        let mut root = RawModuleDefV10Builder::new();
+        root.add_submodule("outerLib", middle.finish());
+        let mut def: ModuleDef = root.finish().try_into().unwrap();
+
+        for _ in 0..3 {
+            let child = &def.submodules()["outer_lib"].submodules()["InnerWire"];
+            let table = &child.tables[&expect_identifier("WireOutbox")];
+            let outbox = table.outbox.as_ref().unwrap();
+            let callback = outbox.on_result_reducer.as_ref().unwrap();
+            assert_eq!(&**callback, "outer_lib.InnerWire.ResultDone");
+            assert_eq!(
+                def.reducer_by_name(callback).unwrap().1.visibility,
+                FunctionVisibility::Private
+            );
+            assert_eq!(outbox.remote_reducer, ReducerName::for_test("receive_ping"));
+            assert_eq!(&*table.accessor_name, "PingOutbox");
+
+            let raw: RawModuleDefV10 = def.into();
+            def = raw.try_into().expect("mounted outbox callback should round-trip");
+        }
+    }
+
     #[test]
     fn missing_scheduled_reducer() {
         let mut builder = RawModuleDefV10Builder::new();
@@ -1746,6 +2922,155 @@ mod tests {
         });
     }
 
+    #[test]
+    fn duplicate_http_handler_names() {
+        let mut builder = RawModuleDefV10Builder::new();
+
+        builder.add_http_handler("handle");
+        builder.add_http_handler("handle");
+
+        let result: Result<ModuleDef> = builder.finish().try_into();
+
+        expect_error_matching!(result, ValidationError::DuplicateHttpHandlerName { name } => {
+            name == &expect_identifier("handle")
+        });
+    }
+
+    #[test]
+    fn http_routes_same_path_and_method() {
+        let mut builder = RawModuleDefV10Builder::new();
+
+        builder.add_http_handler("handle");
+        builder.add_http_route("handle", MethodOrAny::Method(HttpMethod::Get), "/hook");
+        builder.add_http_route("handle", MethodOrAny::Method(HttpMethod::Get), "/hook");
+
+        let result: Result<ModuleDef> = builder.finish().try_into();
+
+        expect_error_matching!(result, ValidationError::DuplicateHttpRoute { path, method } => {
+            path.as_ref() == "/hook" && *method == MethodOrAny::Method(HttpMethod::Get)
+        });
+    }
+
+    #[test]
+    fn http_routes_overlap_with_any() {
+        let mut builder = RawModuleDefV10Builder::new();
+
+        builder.add_http_handler("handle");
+        builder.add_http_route("handle", MethodOrAny::Any, "/hook");
+        builder.add_http_route("handle", MethodOrAny::Method(HttpMethod::Get), "/hook");
+
+        let result: Result<ModuleDef> = builder.finish().try_into();
+
+        expect_error_matching!(result, ValidationError::DuplicateHttpRoute { path, method } => {
+            path.as_ref() == "/hook" && *method == MethodOrAny::Method(HttpMethod::Get)
+        });
+    }
+
+    #[test]
+    fn http_routes_invalid_paths() {
+        let mut builder = RawModuleDefV10Builder::new();
+
+        builder.add_http_handler("handle");
+        builder.add_http_route("handle", MethodOrAny::Any, "no-slash");
+        for path in [
+            "/Uppercase",
+            "/caf\u{e9}",
+            "/ampersand&",
+            "/dollar$",
+            "/plus+",
+            "/comma,",
+            "/colon:",
+            "/semicolon;",
+            "/equals=",
+            "/question?",
+            "/at@",
+            "/hash#",
+            "/space here",
+            "/less<",
+            "/greater>",
+            "/left[",
+            "/right]",
+            "/left-brace{",
+            "/right-brace}",
+            "/pipe|",
+            "/backslash\\",
+            "/caret^",
+            "/percent%",
+        ] {
+            builder.add_http_route("handle", MethodOrAny::Any, path);
+        }
+
+        let result: Result<ModuleDef> = builder.finish().try_into();
+
+        if let Err(errs) = result {
+            let mut paths = errs
+                .iter()
+                .filter_map(|err| match err {
+                    ValidationError::InvalidHttpRoutePath { path } => Some(path.as_ref()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            paths.sort_unstable();
+
+            let mut expected = vec![
+                "no-slash",
+                "/Uppercase",
+                "/caf\u{e9}",
+                "/ampersand&",
+                "/dollar$",
+                "/plus+",
+                "/comma,",
+                "/colon:",
+                "/semicolon;",
+                "/equals=",
+                "/question?",
+                "/at@",
+                "/hash#",
+                "/space here",
+                "/less<",
+                "/greater>",
+                "/left[",
+                "/right]",
+                "/left-brace{",
+                "/right-brace}",
+                "/pipe|",
+                "/backslash\\",
+                "/caret^",
+                "/percent%",
+            ];
+            expected.sort_unstable();
+
+            assert_eq!(paths, expected);
+        } else {
+            panic!("expected invalid HTTP route path errors");
+        }
+    }
+
+    #[test]
+    fn http_routes_missing_handler() {
+        let mut builder = RawModuleDefV10Builder::new();
+
+        builder.add_http_route("missing", MethodOrAny::Any, "/hook");
+
+        let result: Result<ModuleDef> = builder.finish().try_into();
+
+        expect_error_matching!(result, ValidationError::MissingHttpHandler { handler } => {
+            handler.as_ref() == "missing"
+        });
+    }
+
+    #[test]
+    fn reducer_and_http_handler_can_share_name() {
+        let mut builder = RawModuleDefV10Builder::new();
+
+        builder.add_reducer("handle", ProductType::unit());
+        builder.add_http_handler("handle");
+
+        let result: Result<ModuleDef> = builder.finish().try_into();
+
+        assert!(result.is_ok());
+    }
+
     fn make_case_conversion_builder() -> (RawModuleDefV10Builder, AlgebraicTypeRef) {
         let mut builder = RawModuleDefV10Builder::new();
 
@@ -1753,7 +3078,7 @@ mod tests {
         let color_sum = AlgebraicType::simple_enum(["RedApple", "GreenApple", "YellowApple"].into_iter());
         let color_ref = builder.add_algebraic_type([], "FruitColor", color_sum, true);
 
-        // Product type with scope: scope segments stay unchanged, unscoped name → PascalCase.
+        // Product type with scope: the scope segments and the unscoped name all become PascalCase.
         builder.add_algebraic_type(
             ["myLib".into(), "utils".into()],
             "metaInfo",
@@ -1820,7 +3145,7 @@ mod tests {
     /// | Table name      | any              | snake_case                | raw name preserved as accessor |
     /// | Column name     | any              | snake_case                | raw name preserved as accessor |
     /// | Reducer name    | any              | snake_case                | —                              |
-    /// | Type name       | any (unscoped)   | PascalCase                | scope segments unchanged       |
+    /// | Type name       | any              | PascalCase                | scope segments too             |
     /// | Enum variant    | any              | camelCase                 | —                              |
     /// | Index name      | autogenerated    | `{tbl}_{cols}_idx_{algo}` | uses canonical table+col names |
     /// | Index accessor  | raw source_name  | **unchanged**             | no conversion applied          |
@@ -1925,7 +3250,7 @@ mod tests {
             def.reducers.contains_key(&do_delivery),
             "reducer 'do_delivery' not found"
         );
-        assert_eq!(def.reducers[&do_delivery].name.as_identifier(), &do_delivery);
+        assert_eq!(def.reducers[&do_delivery].name.local(), &do_delivery);
 
         // "ProcessItem" (PascalCase) → "process_item"
         let process_item = id("process_item");
@@ -1933,10 +3258,10 @@ mod tests {
             def.reducers.contains_key(&process_item),
             "reducer 'process_item' not found"
         );
-        assert_eq!(def.reducers[&process_item].name.as_identifier(), &process_item);
+        assert_eq!(def.reducers[&process_item].name.local(), &process_item);
 
         // ═══════════════════════════════════════════════════════════════════════════
-        // TYPE NAMES — PascalCase; scoped names keep their scope segments unchanged
+        // TYPE NAMES — PascalCase, including each scope segment
         // ═══════════════════════════════════════════════════════════════════════════
 
         // "FruitColor" (already Pascal) → "FruitColor"
@@ -1945,10 +3270,10 @@ mod tests {
             "type 'FruitColor' not found"
         );
 
-        // "metaInfo" (lower-camel unscoped) → "MetaInfo"; scope "myLib","utils" → unchanged
+        // "metaInfo" (lower-camel unscoped) → "MetaInfo"; scope "myLib","utils" → "MyLib","Utils"
         assert!(
             def.types.contains_key(&expect_type_name("MyLib::Utils::MetaInfo")),
-            "type 'myLib::utils::MetaInfo' not found"
+            "type 'MyLib::Utils::MetaInfo' not found"
         );
 
         // Anonymous table types keep the raw source name as-is.
@@ -2194,7 +3519,7 @@ mod tests {
             !def.reducers.contains_key(&id("do_delivery")),
             "'do_delivery' must not exist when overridden"
         );
-        assert_eq!(def.reducers[&deliver_ident].name.as_identifier(), &deliver_ident);
+        assert_eq!(def.reducers[&deliver_ident].name.local(), &deliver_ident);
 
         // Non-overridden reducer still follows SnakeCase.
         assert!(def.reducers.contains_key(&id("process_item")));
@@ -2249,5 +3574,220 @@ mod tests {
         assert_eq!(view.accessor_name, id("PersonAtLevel2"));
         assert_eq!(view.return_columns[0].view_name, id("Level2Person"));
         assert_eq!(view.param_columns[0].view_name, id("Level2Person"));
+    }
+
+    #[test]
+    fn view_primary_key_with_params_is_rejected() {
+        let mut builder = RawModuleDefV10Builder::new();
+        let return_type_ref =
+            builder.add_algebraic_type([], "Person", AlgebraicType::product([("id", AlgebraicType::U64)]), true);
+        builder.add_view(
+            "person_by_id",
+            0,
+            true,
+            true,
+            ProductType::from([("id", AlgebraicType::U64)]),
+            AlgebraicType::array(AlgebraicType::Ref(return_type_ref)),
+        );
+        builder.add_view_primary_key("person_by_id", ["id"]);
+
+        let result: Result<ModuleDef> = builder.finish().try_into();
+        expect_error_matching!(result, ValidationError::ViewPrimaryKeyWithParams { view } => {
+            view == &RawIdentifier::from("person_by_id")
+        });
+    }
+
+    #[test]
+    fn view_float_param_is_rejected() {
+        let mut builder = RawModuleDefV10Builder::new();
+        let return_type_ref =
+            builder.add_algebraic_type([], "Person", AlgebraicType::product([("id", AlgebraicType::U64)]), true);
+        builder.add_view(
+            "people_near",
+            0,
+            true,
+            true,
+            ProductType::from([("x", AlgebraicType::F64)]),
+            AlgebraicType::array(AlgebraicType::Ref(return_type_ref)),
+        );
+
+        let result: Result<ModuleDef> = builder.finish().try_into();
+        expect_error_matching!(result, ValidationError::ViewFloatParam { view, param } => {
+            view == &RawIdentifier::from("people_near") && param == &RawIdentifier::from("x")
+        });
+    }
+
+    #[test]
+    fn query_view_with_params_has_no_primary_key() {
+        let mut builder = RawModuleDefV10Builder::new();
+        let person_ref = builder
+            .build_table_with_new_type("person", ProductType::from([("id", AlgebraicType::U64)]), true)
+            .with_unique_constraint(ColId(0))
+            .with_primary_key(0)
+            .with_index_no_accessor_name(btree(0), "person_id")
+            .finish();
+        let query_type = AlgebraicType::product([(QUERY_VIEW_RETURN_TAG, AlgebraicType::Ref(person_ref))]);
+        builder.add_view("all_people", 0, true, true, ProductType::unit(), query_type.clone());
+        builder.add_view(
+            "person_by_id",
+            1,
+            true,
+            true,
+            ProductType::from([("id", AlgebraicType::U64)]),
+            query_type,
+        );
+
+        let def: ModuleDef = builder.finish().try_into().unwrap();
+        assert_eq!(def.view("all_people").unwrap().primary_key, Some(ColId(0)));
+        assert_eq!(def.view("person_by_id").unwrap().primary_key, None);
+    }
+
+    #[test]
+    fn namespace_exactly_63_chars_is_ok() {
+        let namespace = "a".repeat(63);
+        let raw = RawModuleDefV10 {
+            sections: vec![RawModuleDefV10Section::Submodules(vec![RawSubmoduleV10 {
+                namespace,
+                module: RawModuleDefV10::default(),
+            }])],
+        };
+        let result: Result<ModuleDef> = raw.try_into();
+        assert!(result.is_ok(), "63-char namespace should be valid");
+    }
+
+    #[test]
+    fn namespace_64_chars_is_rejected() {
+        let namespace = "a".repeat(64);
+        let raw = RawModuleDefV10 {
+            sections: vec![RawModuleDefV10Section::Submodules(vec![RawSubmoduleV10 {
+                namespace: namespace.clone(),
+                module: RawModuleDefV10::default(),
+            }])],
+        };
+        let expected_ns = RawIdentifier::from(namespace.clone());
+        let result: Result<ModuleDef> = raw.try_into();
+        expect_error_matching!(result, ValidationError::NamespaceTooLong { namespace: ns, len } => {
+            ns == &expected_ns && len == &64usize
+        });
+    }
+
+    fn make_module_with_lifecycle(lifecycle: Lifecycle) -> RawModuleDefV10 {
+        let mut b = RawModuleDefV10Builder::new();
+        b.add_lifecycle_reducer(lifecycle, "lifecycle_fn", ProductType::unit());
+        b.finish()
+    }
+
+    #[test]
+    fn lifecycle_in_submodule_is_rejected() {
+        let raw = RawModuleDefV10 {
+            sections: vec![RawModuleDefV10Section::Submodules(vec![RawSubmoduleV10 {
+                namespace: "auth".to_string(),
+                module: make_module_with_lifecycle(Lifecycle::Init),
+            }])],
+        };
+
+        let result: Result<ModuleDef> = raw.try_into();
+        expect_error_matching!(result, ValidationError::LifecycleInSubmodule { lifecycle, namespace } => {
+            lifecycle == &Lifecycle::Init && namespace == "auth"
+        });
+    }
+
+    #[test]
+    fn lifecycle_in_root_with_submodule_is_ok() {
+        // Root declares Init; the submodule has no lifecycle — this is valid.
+        let consumer_raw = make_module_with_lifecycle(Lifecycle::Init);
+        let mut sections = consumer_raw.sections;
+        sections.push(RawModuleDefV10Section::Submodules(vec![RawSubmoduleV10 {
+            namespace: "auth".to_string(),
+            module: RawModuleDefV10::default(),
+        }]));
+
+        let result: Result<ModuleDef> = RawModuleDefV10 { sections }.try_into();
+        assert!(
+            result.is_ok(),
+            "lifecycle in root with a lifecycle-free submodule should be valid"
+        );
+    }
+
+    #[test]
+    fn lifecycle_in_nested_submodule_is_rejected() {
+        // Root uses auth as submodule; auth uses baz as submodule; baz declares a lifecycle. Should be rejected.
+        let auth = RawModuleDefV10 {
+            sections: vec![RawModuleDefV10Section::Submodules(vec![RawSubmoduleV10 {
+                namespace: "baz".to_string(),
+                module: make_module_with_lifecycle(Lifecycle::Init),
+            }])],
+        };
+
+        let raw = RawModuleDefV10 {
+            sections: vec![RawModuleDefV10Section::Submodules(vec![RawSubmoduleV10 {
+                namespace: "auth".to_string(),
+                module: auth,
+            }])],
+        };
+
+        let result: Result<ModuleDef> = raw.try_into();
+        expect_error_matching!(result, ValidationError::LifecycleInSubmodule { lifecycle, namespace } => {
+            lifecycle == &Lifecycle::Init && namespace == "baz"
+        });
+    }
+}
+
+#[cfg(test)]
+mod environment_tests {
+    use super::*;
+
+    fn declared(name: &str) -> RawModuleDefV10 {
+        RawModuleDefV10 {
+            sections: vec![RawModuleDefV10Section::Environment(vec![
+                RawEnvironmentDeclarationV10 {
+                    name: name.into(),
+                    ty: RawEnvVarTypeV10::String,
+                    optional: true,
+                },
+            ])],
+        }
+    }
+
+    #[test]
+    fn environment_schema_round_trip_preserves_exact_keys() {
+        let module = validate(declared("Mixed_CASE")).unwrap();
+        assert!(module.environment().get("Mixed_CASE").is_some());
+        assert!(module.environment().get("mixed_case").is_none());
+        let raw: RawModuleDefV10 = module.into();
+        assert!(validate(raw).unwrap().environment().get("Mixed_CASE").is_some());
+        assert_eq!(
+            spacetimedb_lib::bsatn::to_vec(&RawModuleDefV10Section::Environment(vec![])).unwrap(),
+            vec![15, 0, 0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn environment_rejects_ambiguous_sections_and_nested_declarations() {
+        let nested = RawModuleDefV10 {
+            sections: vec![RawModuleDefV10Section::Submodules(vec![RawSubmoduleV10 {
+                namespace: "outer".into(),
+                module: RawModuleDefV10 {
+                    sections: vec![RawModuleDefV10Section::Submodules(vec![RawSubmoduleV10 {
+                        namespace: "inner".into(),
+                        module: declared("SECRET"),
+                    }])],
+                },
+            }])],
+        };
+        assert!(validate(nested)
+            .unwrap_err()
+            .into_iter()
+            .any(|error| matches!(error, ValidationError::EnvironmentInSubmodule { .. })));
+        let empty = RawModuleDefV10 {
+            sections: vec![RawModuleDefV10Section::Submodules(vec![RawSubmoduleV10 {
+                namespace: "allowed".into(),
+                module: RawModuleDefV10 {
+                    sections: vec![RawModuleDefV10Section::Environment(vec![])],
+                },
+            }])],
+        };
+        assert!(validate(empty).is_ok());
+        assert!(validate(declared("INVALID-NAME")).is_err());
     }
 }

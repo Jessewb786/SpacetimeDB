@@ -53,7 +53,6 @@
 //!                                           v
 //!                                      SendWorker
 //! ```
-use self::budget::energy_from_elapsed;
 use self::error::{
     catch_exception, exception_already_thrown, log_traceback, ErrorOrException, ExcResult, ExceptionThrown,
     PinTryCatch, Throwable,
@@ -61,12 +60,13 @@ use self::error::{
 use self::ser::serialize_to_js;
 use self::string::{str_from_ident, IntoJsString};
 use self::syscall::{
-    call_call_procedure, call_call_reducer, call_call_view, call_call_view_anon, call_describe_module, get_hooks,
-    process_thrown_exception, resolve_sys_module, FnRet, HookFunctions,
+    call_call_http_handler, call_call_procedure, call_call_reducer, call_call_view, call_call_view_anon,
+    call_describe_module, get_hooks, process_thrown_exception, resolve_sys_module, FnRet, HookFunctions,
 };
 use super::module_common::{build_common_module_from_raw, run_describer, ModuleCommon};
 use super::module_host::{
-    CallProcedureParams, CallReducerParams, InstanceManagerMetrics, ModuleInfo, ModuleWithInstance,
+    CallHttpHandlerParams, CallProcedureParams, CallReducerParams, IdcDeliveryFailure, IdcMessageParams,
+    IdcReducerCallOutcome, InstanceManagerMetrics, ModuleInfo, ModuleWithInstance, UpdateEnvironmentResult,
 };
 use super::UpdateDatabaseResult;
 use crate::client::{ClientActorId, MeteredUnboundedReceiver, MeteredUnboundedSender};
@@ -74,21 +74,24 @@ use crate::config::{V8Config, V8HeapPolicyConfig};
 use crate::host::host_controller::CallProcedureReturn;
 use crate::host::instance_env::{ChunkPool, InstanceEnv, TxSlot};
 use crate::host::module_host::{
-    call_identity_connected, init_database, ClientConnectedError, OneOffQueryRequest, SqlCommand, SqlCommandResult,
-    ViewCommand, ViewCommandMetric, ViewCommandResult,
+    call_identity_connected, init_database, ClientConnectedError, HttpHandlerCallError, OneOffQueryRequest, SqlCommand,
+    SqlCommandResult, ViewCommand, ViewCommandMetric, ViewCommandResult,
 };
 use crate::host::scheduler::{CallScheduledFunctionResult, ScheduledFunctionParams};
 use crate::host::wasm_common::instrumentation::CallTimes;
 use crate::host::wasm_common::module_host_actor::{
-    AnonymousViewOp, DescribeError, ExecutionError, ExecutionResult, ExecutionStats, ExecutionTimings, InstanceCommon,
-    InstanceOp, ProcedureExecuteResult, ProcedureOp, ReducerExecuteResult, ReducerOp, ViewExecuteResult, ViewOp,
-    WasmInstance,
+    AnonymousViewOp, DescribeError, EnergyStats, ExecutionError, ExecutionResult, ExecutionStats, ExecutionTimings,
+    HttpHandlerExecuteResult, HttpHandlerOp, InstanceCommon, InstanceOp, ProcedureExecuteResult, ProcedureOp,
+    ReducerExecuteResult, ReducerOp, ReducerSuccessAction, ViewExecuteResult, ViewOp, WasmInstance,
 };
 use crate::host::wasm_common::{RowIters, TimingSpanSet};
-use crate::host::{ModuleHost, ReducerCallError, ReducerCallResult, Scheduler};
+use crate::host::{
+    InitDatabaseResult, ModuleHost, ReducerCallError, ReducerCallResult, ReducerCallResultWithTxOffset, Scheduler,
+};
 use crate::messages::control_db::HostType;
 use crate::module_host_context::ModuleCreationContext;
 use crate::replica_context::ReplicaContext;
+use crate::resource::ModuleInstanceMemoryTracker;
 use crate::subscription::module_subscription_manager::TransactionOffset;
 use crate::util::jobs::{AllocatedJobCore, CorePinner, LoadBalanceOnDropGuard};
 use crate::worker_metrics::WORKER_METRICS;
@@ -103,7 +106,7 @@ use spacetimedb_datastore::traits::Program;
 use spacetimedb_lib::{ConnectionId, Identity, RawModuleDef, Timestamp};
 use spacetimedb_schema::auto_migrate::MigrationPolicy;
 use spacetimedb_schema::def::ModuleDef;
-use spacetimedb_schema::identifier::Identifier;
+use spacetimedb_schema::identifier::NamespacedIdentifier;
 use spacetimedb_table::static_assert_size;
 use std::cell::Cell;
 use std::num::NonZeroUsize;
@@ -169,17 +172,19 @@ impl V8Runtime {
 static V8_RUNTIME_GLOBAL: LazyLock<V8RuntimeInner> = LazyLock::new(V8RuntimeInner::init);
 const REDUCER_ARGS_BUFFER_SIZE: usize = 4_096;
 const JS_PROCEDURE_INSTANCE_QUEUE_CAPACITY: usize = 1;
-pub(crate) const V8_WORKER_KIND_MAIN: &str = "main";
 
 #[derive(Copy, Clone)]
-enum JsWorkerKind {
+pub enum JsWorkerKind {
     Main,
     Procedure,
 }
 
-impl JsWorkerKind {
-    const fn checks_heap(self) -> bool {
-        matches!(self, Self::Main)
+impl AsRef<str> for JsWorkerKind {
+    fn as_ref(&self) -> &str {
+        match self {
+            Self::Main => "main",
+            Self::Procedure => "procedure",
+        }
     }
 }
 
@@ -238,8 +243,14 @@ impl V8RuntimeInner {
         // Validate/create the module and spawn the first instance.
         let metrics = InstanceManagerMetrics::new(HostType::Js, mcc.replica_ctx.database_identity);
         let mcc = Either::Right(mcc);
+
+        // The JS main worker and procedure workers run on separate OS threads,
+        // but they intentionally share one database core allocation.
+        // When core pinning is enabled, all worker threads pin to the same core
+        // and rebalance together because they use clones of the same `CorePinner`.
         let load_balance_guard = Arc::new(core.guard);
         let core_pinner = core.pinner;
+
         let heap_policy = config.heap_policy;
         let (common, init_inst) = spawn_main_instance_worker(
             program.clone(),
@@ -282,6 +293,10 @@ impl JsModule {
 
     pub fn scheduler(&self) -> &Scheduler {
         self.common.scheduler()
+    }
+
+    pub fn idc_sender(&self) -> super::idc_actor::IdcActorSender {
+        self.common.idc_sender()
     }
 
     pub fn info(&self) -> Arc<ModuleInfo> {
@@ -337,8 +352,6 @@ fn env_on_isolate_unwrap(isolate: &mut Isolate) -> &mut JsInstanceEnv {
 struct JsInstanceEnv {
     instance_env: InstanceEnv,
     module_def: Option<Arc<ModuleDef>>,
-    /// Last used-heap sample captured by the worker's periodic heap checks.
-    cached_used_heap_size: usize,
 
     /// The slab of `BufferIters` created for this instance.
     iters: RowIters,
@@ -363,7 +376,6 @@ impl JsInstanceEnv {
         Self {
             instance_env,
             module_def: None,
-            cached_used_heap_size: 0,
             call_times: CallTimes::new(),
             iters: <_>::default(),
             chunk_pool: <_>::default(),
@@ -375,7 +387,7 @@ impl JsInstanceEnv {
     ///
     /// Returns the handle used by reducers to read from `args`
     /// as well as the handle used to write the error message, if any.
-    fn start_funcall(&mut self, name: Identifier, ts: Timestamp, func_type: FuncCallType) {
+    fn start_funcall(&mut self, name: NamespacedIdentifier, ts: Timestamp, func_type: FuncCallType) {
         self.instance_env.start_funcall(name, ts, func_type);
     }
 
@@ -394,18 +406,19 @@ impl JsInstanceEnv {
     /// This resets all of the state associated to a single function call,
     /// and returns instrumentation records.
     fn finish_funcall(&mut self) -> ExecutionTimings {
+        self.instance_env.finish_funcall();
         let total_duration = self.reducer_start().elapsed();
         let func_name = self.log_record_function().unwrap_or("<unknown>").to_owned();
 
         let leftover_iters = self.iters.len();
         if leftover_iters > 0 {
-            log::warn!("force-clearing {leftover_iters} row iterator(s) left open by JS call `{func_name}`");
+            log::debug!("force-clearing {leftover_iters} row iterator(s) left open by JS call `{func_name}`");
             self.iters.clear();
         }
 
         let leftover_timing_spans = self.timing_spans.len();
         if leftover_timing_spans > 0 {
-            log::warn!("force-clearing {leftover_timing_spans} timing span(s) left open by JS call `{func_name}`");
+            log::debug!("force-clearing {leftover_timing_spans} timing span(s) left open by JS call `{func_name}`");
             self.timing_spans.clear();
         }
 
@@ -418,17 +431,9 @@ impl JsInstanceEnv {
         }
     }
 
-    /// Refresh the cached heap usage after an explicit V8 heap sample.
-    fn set_cached_used_heap_size(&mut self, bytes: usize) {
-        self.cached_used_heap_size = bytes;
-    }
-
-    /// Return the last heap sample without forcing a fresh V8 query.
-    fn cached_used_heap_size(&self) -> usize {
-        self.cached_used_heap_size
-    }
-
-    fn set_module_def(&mut self, module_def: Arc<ModuleDef>) {
+    fn set_module_def(&mut self, module_def: Arc<ModuleDef>, module_hash: spacetimedb_lib::Hash) {
+        self.instance_env
+            .bind_environment_module(module_hash, module_def.clone());
         self.module_def = Some(module_def);
     }
 
@@ -479,17 +484,45 @@ impl JsMainInstance {
         program: Program,
         old_module_info: Arc<ModuleInfo>,
         policy: MigrationPolicy,
+        environment: std::collections::BTreeMap<String, String>,
     ) -> anyhow::Result<UpdateDatabaseResult> {
         self.request(UpdateDatabaseRequest {
             program,
             old_module_info,
             policy,
+            environment,
         })
         .await
     }
 
+    pub async fn update_environment(
+        &self,
+        environment: std::collections::BTreeMap<String, String>,
+    ) -> anyhow::Result<UpdateEnvironmentResult> {
+        self.request(UpdateEnvironmentRequest { environment }).await
+    }
+
     pub async fn call_reducer(&self, params: CallReducerParams) -> ReducerCallResult {
+        self.request(CallReducerRequest { params }).await.result
+    }
+
+    /// Like [`Self::call_reducer`], but also returns the offset of the reducer's transaction.
+    pub async fn call_reducer_with_offset(&self, params: CallReducerParams) -> ReducerCallResultWithTxOffset {
         self.request(CallReducerRequest { params }).await
+    }
+
+    pub(in crate::host) async fn call_idc_reducer(
+        &self,
+        params: CallReducerParams,
+        delivery: IdcMessageParams,
+        on_success: ReducerSuccessAction,
+    ) -> Result<IdcReducerCallOutcome, IdcDeliveryFailure> {
+        self.request(CallIdcReducerRequest {
+            params,
+            delivery,
+            on_success,
+        })
+        .await
     }
 
     pub(in crate::host) async fn call_scheduled_reducer(
@@ -497,6 +530,13 @@ impl JsMainInstance {
         params: ScheduledFunctionParams,
     ) -> CallScheduledFunctionResult {
         self.request(ScheduledReducerRequest { params }).await
+    }
+
+    pub(in crate::host) async fn run_idc_callback_and_cleanup(
+        &self,
+        msg: crate::host::idc_actor::DeliveredMessage,
+    ) -> anyhow::Result<()> {
+        self.request(RunIdcCallbackAndCleanupRequest { msg }).await
     }
 
     pub(in crate::host) async fn enqueue_reducer(&self, params: CallReducerParams, on_panic: JsFatalHook) {
@@ -539,8 +579,12 @@ impl JsMainInstance {
         self.request(DisconnectClientRequest { client_id }).await
     }
 
-    pub async fn init_database(&self, program: Program) -> anyhow::Result<Option<ReducerCallResult>> {
-        self.request(InitDatabaseRequest { program }).await
+    pub async fn init_database(
+        &self,
+        program: Program,
+        environment: std::collections::BTreeMap<String, String>,
+    ) -> anyhow::Result<InitDatabaseResult> {
+        self.request(InitDatabaseRequest { program, environment }).await
     }
 
     pub async fn call_view(&self, cmd: ViewCommand) -> ViewCommandResult {
@@ -624,19 +668,40 @@ js_main_request! {
         program: Program,
         old_module_info: Arc<ModuleInfo>,
         policy: MigrationPolicy,
+        environment: std::collections::BTreeMap<String, String>,
     } => "update_database", anyhow::Result<UpdateDatabaseResult>, UpdateDatabase
+}
+
+js_main_request! {
+    UpdateEnvironmentRequest {
+        environment: std::collections::BTreeMap<String, String>,
+    } => "update_environment", anyhow::Result<UpdateEnvironmentResult>, UpdateEnvironment
 }
 
 js_main_request! {
     CallReducerRequest {
         params: CallReducerParams,
-    } => "call_reducer", ReducerCallResult, CallReducer
+    } => "call_reducer", ReducerCallResultWithTxOffset, CallReducer
 }
 
 js_main_request! {
     ScheduledReducerRequest {
         params: ScheduledFunctionParams,
     } => "scheduled_reducer", CallScheduledFunctionResult, ScheduledReducer
+}
+
+js_main_request! {
+    CallIdcReducerRequest {
+        params: CallReducerParams,
+        delivery: IdcMessageParams,
+        on_success: ReducerSuccessAction,
+    } => "call_idc_reducer", Result<IdcReducerCallOutcome, IdcDeliveryFailure>, CallIdcReducer
+}
+
+js_main_request! {
+    RunIdcCallbackAndCleanupRequest {
+        msg: crate::host::idc_actor::DeliveredMessage,
+    } => "run_idc_callback_and_cleanup", anyhow::Result<()>, RunIdcCallbackAndCleanup
 }
 
 js_main_request! {
@@ -666,7 +731,8 @@ js_main_request! {
 js_main_request! {
     InitDatabaseRequest {
         program: Program,
-    } => "init_database", anyhow::Result<Option<ReducerCallResult>>, InitDatabase
+        environment: std::collections::BTreeMap<String, String>,
+    } => "init_database", anyhow::Result<InitDatabaseResult>, InitDatabase
 }
 
 js_main_request! {
@@ -698,6 +764,16 @@ impl JsProcedureInstance {
         self.send_request("call_procedure", |reply_tx| JsProcedureWorkerRequest::CallProcedure {
             reply_tx,
             params,
+        })
+        .await
+    }
+
+    pub async fn call_http_handler(
+        &self,
+        params: CallHttpHandlerParams,
+    ) -> Result<(spacetimedb_lib::http::Response, bytes::Bytes), HttpHandlerCallError> {
+        self.send_request("call_http_handler", |reply_tx| {
+            JsProcedureWorkerRequest::CallHttpHandler { reply_tx, params }
         })
         .await
     }
@@ -798,11 +874,24 @@ enum JsMainWorkerRequest {
         program: Program,
         old_module_info: Arc<ModuleInfo>,
         policy: MigrationPolicy,
+        environment: std::collections::BTreeMap<String, String>,
+    },
+    /// See [`JsMainInstance::update_environment`].
+    UpdateEnvironment {
+        reply_tx: JsReplyTx<anyhow::Result<UpdateEnvironmentResult>>,
+        environment: std::collections::BTreeMap<String, String>,
     },
     /// See [`JsMainInstance::call_reducer`].
     CallReducer {
-        reply_tx: JsReplyTx<ReducerCallResult>,
+        reply_tx: JsReplyTx<ReducerCallResultWithTxOffset>,
         params: CallReducerParams,
+    },
+    /// See [`JsMainInstance::call_idc_reducer`].
+    CallIdcReducer {
+        reply_tx: JsReplyTx<Result<IdcReducerCallOutcome, IdcDeliveryFailure>>,
+        params: CallReducerParams,
+        delivery: IdcMessageParams,
+        on_success: ReducerSuccessAction,
     },
     /// See [`JsMainInstance::enqueue_reducer`].
     CallReducerDetached {
@@ -813,6 +902,10 @@ enum JsMainWorkerRequest {
     ScheduledReducer {
         reply_tx: JsReplyTx<CallScheduledFunctionResult>,
         params: ScheduledFunctionParams,
+    },
+    RunIdcCallbackAndCleanup {
+        reply_tx: JsReplyTx<anyhow::Result<()>>,
+        msg: crate::host::idc_actor::DeliveredMessage,
     },
     /// See [`JsMainInstance::call_view`].
     CallView {
@@ -835,7 +928,7 @@ enum JsMainWorkerRequest {
         request: OneOffQueryRequest,
         on_panic: JsFatalHook,
     },
-    /// See [`JsMainInstance::clear_all_clients`].
+    /// See [`JsInstance::clear_all_clients`].
     ClearAllClients(JsReplyTx<anyhow::Result<()>>),
     /// See [`JsMainInstance::call_identity_connected`].
     CallIdentityConnected {
@@ -856,8 +949,9 @@ enum JsMainWorkerRequest {
     },
     /// See [`JsMainInstance::init_database`].
     InitDatabase {
-        reply_tx: JsReplyTx<anyhow::Result<Option<ReducerCallResult>>>,
+        reply_tx: JsReplyTx<anyhow::Result<InitDatabaseResult>>,
         program: Program,
+        environment: std::collections::BTreeMap<String, String>,
     },
 }
 
@@ -873,19 +967,24 @@ enum JsProcedureWorkerRequest {
         reply_tx: JsReplyTx<CallScheduledFunctionResult>,
         params: ScheduledFunctionParams,
     },
+    /// See [`JsInstance::call_http_handler`].
+    CallHttpHandler {
+        reply_tx: JsReplyTx<Result<(spacetimedb_lib::http::Response, bytes::Bytes), HttpHandlerCallError>>,
+        params: CallHttpHandlerParams,
+    },
 }
 
 static_assert_size!(CallReducerParams, 192);
 
 fn send_worker_reply<T>(ctx: &str, reply_tx: JsReplyTx<T>, value: T) {
     if reply_tx.send(Ok(value)).is_err() {
-        log::error!("should have receiver for `{ctx}` response");
+        log::warn!("should have receiver for `{ctx}` response");
     }
 }
 
 fn send_worker_panic_reply<T>(ctx: &str, reply_tx: JsReplyTx<T>, panic: JsPanicPayload) {
     if reply_tx.send(Err(panic)).is_err() {
-        log::error!("should have receiver for `{ctx}` response");
+        log::warn!("should have receiver for `{ctx}` response");
     }
 }
 
@@ -939,14 +1038,14 @@ fn handle_detached_worker_request(
             }
         }
         Err(_) => {
-            log::warn!("detached JS worker request `{ctx}` panicked");
+            log::error!("detached JS worker request `{ctx}` panicked");
             on_panic();
             WorkerRequestOutcome::Fatal
         }
     }
 }
 
-struct V8HeapMetrics {
+pub(in crate::host) struct V8HeapMetrics {
     total_heap_size_bytes: IntGauge,
     total_physical_size_bytes: IntGauge,
     used_global_handles_size_bytes: IntGauge,
@@ -955,6 +1054,17 @@ struct V8HeapMetrics {
     external_memory_bytes: IntGauge,
     native_contexts: IntGauge,
     detached_contexts: IntGauge,
+    module_instance_memory_tracker: ModuleInstanceMemoryTracker,
+
+    /// Previous values observed by this instance.
+    ///
+    /// In [`Self::observe`], we use this to compute deltas against the new instance's values,
+    /// then increment/decrement the metric values by those deltas.
+    /// We do this rather than `set`ting the metric values as multiple instances may coexist
+    /// and share the same metric label values.
+    /// This happens when a database has multiple procedure workers running,
+    /// and during a module update, as there is a period when the new version has already been created
+    /// but the old version has not yet shut down.
     last_observed: V8HeapSnapshot,
 }
 
@@ -986,32 +1096,62 @@ impl V8HeapSnapshot {
 }
 
 impl V8HeapMetrics {
-    fn new(database_identity: &Identity) -> Self {
+    pub(in crate::host) fn remove_all_metric_label_values_for_database(database_identity: &Identity) {
+        for worker_kind in [JsWorkerKind::Main, JsWorkerKind::Procedure] {
+            let _ = WORKER_METRICS
+                .v8_total_heap_size_bytes
+                .remove_label_values(database_identity, &worker_kind);
+            let _ = WORKER_METRICS
+                .v8_total_physical_size_bytes
+                .remove_label_values(database_identity, &worker_kind);
+            let _ = WORKER_METRICS
+                .v8_used_global_handles_size_bytes
+                .remove_label_values(database_identity, &worker_kind);
+            let _ = WORKER_METRICS
+                .v8_used_heap_size_bytes
+                .remove_label_values(database_identity, &worker_kind);
+            let _ = WORKER_METRICS
+                .v8_heap_size_limit_bytes
+                .remove_label_values(database_identity, &worker_kind);
+            let _ = WORKER_METRICS
+                .v8_external_memory_bytes
+                .remove_label_values(database_identity, &worker_kind);
+            let _ = WORKER_METRICS
+                .v8_native_contexts
+                .remove_label_values(database_identity, &worker_kind);
+            let _ = WORKER_METRICS
+                .v8_detached_contexts
+                .remove_label_values(database_identity, &worker_kind);
+        }
+    }
+
+    fn new(database_identity: &Identity, worker_kind: JsWorkerKind, mem_tracker: ModuleInstanceMemoryTracker) -> Self {
         Self {
             total_heap_size_bytes: WORKER_METRICS
                 .v8_total_heap_size_bytes
-                .with_label_values(database_identity, V8_WORKER_KIND_MAIN),
+                .with_label_values(database_identity, &worker_kind),
             total_physical_size_bytes: WORKER_METRICS
                 .v8_total_physical_size_bytes
-                .with_label_values(database_identity, V8_WORKER_KIND_MAIN),
+                .with_label_values(database_identity, &worker_kind),
             used_global_handles_size_bytes: WORKER_METRICS
                 .v8_used_global_handles_size_bytes
-                .with_label_values(database_identity, V8_WORKER_KIND_MAIN),
+                .with_label_values(database_identity, &worker_kind),
             used_heap_size_bytes: WORKER_METRICS
                 .v8_used_heap_size_bytes
-                .with_label_values(database_identity, V8_WORKER_KIND_MAIN),
+                .with_label_values(database_identity, &worker_kind),
             heap_size_limit_bytes: WORKER_METRICS
                 .v8_heap_size_limit_bytes
-                .with_label_values(database_identity, V8_WORKER_KIND_MAIN),
+                .with_label_values(database_identity, &worker_kind),
             external_memory_bytes: WORKER_METRICS
                 .v8_external_memory_bytes
-                .with_label_values(database_identity, V8_WORKER_KIND_MAIN),
+                .with_label_values(database_identity, &worker_kind),
             native_contexts: WORKER_METRICS
                 .v8_native_contexts
-                .with_label_values(database_identity, V8_WORKER_KIND_MAIN),
+                .with_label_values(database_identity, &worker_kind),
             detached_contexts: WORKER_METRICS
                 .v8_detached_contexts
-                .with_label_values(database_identity, V8_WORKER_KIND_MAIN),
+                .with_label_values(database_identity, &worker_kind),
+            module_instance_memory_tracker: mem_tracker,
             last_observed: V8HeapSnapshot::default(),
         }
     }
@@ -1028,9 +1168,16 @@ impl V8HeapMetrics {
         adjust_gauge(&self.external_memory_bytes, delta.external_memory_bytes);
         adjust_gauge(&self.native_contexts, delta.native_contexts);
         adjust_gauge(&self.detached_contexts, delta.detached_contexts);
+        // Each live V8 isolate reports only the delta from its last heap sample.
+        // The shared tracker folds those deltas into a database-wide aggregate
+        // used tor memory-limit enforcement.
+        self.module_instance_memory_tracker
+            .adjust_v8_physical(delta.total_physical_size_bytes);
     }
 
     fn observe(&mut self, stats: &v8::HeapStatistics) {
+        // See doc comment on `Self::last_observed` for why we compute a delta and apply it to the metrics value
+        // rather than directly calling `set`.
         let next = V8HeapSnapshot::from_stats(stats);
         self.adjust_by(V8HeapSnapshot {
             total_heap_size_bytes: next.total_heap_size_bytes - self.last_observed.total_heap_size_bytes,
@@ -1070,11 +1217,8 @@ fn adjust_gauge(gauge: &IntGauge, delta: i64) {
     }
 }
 
-fn sample_heap_stats(scope: &mut PinScope<'_, '_>, metrics: &mut V8HeapMetrics) -> v8::HeapStatistics {
-    // Whenever we sample heap statistics, we cache them on the isolate so that
-    // the per-call execution stats can avoid querying them on each invocation.
+fn record_heap_stats(scope: &mut PinScope<'_, '_>, metrics: &mut V8HeapMetrics) -> v8::HeapStatistics {
     let stats = scope.get_heap_statistics();
-    env_on_isolate_unwrap(scope).set_cached_used_heap_size(stats.used_heap_size());
     metrics.observe(&stats);
     stats
 }
@@ -1098,14 +1242,14 @@ fn should_retire_worker_for_heap(
     metrics: &mut V8HeapMetrics,
     config: V8HeapPolicyConfig,
 ) -> Option<(usize, usize)> {
-    let stats = sample_heap_stats(scope, metrics);
+    let stats = record_heap_stats(scope, metrics);
     let (used, limit) = heap_usage(&stats);
     if !heap_fraction_at_or_above(used, limit, config.heap_gc_trigger_fraction) {
         return None;
     }
 
     scope.low_memory_notification();
-    let stats = sample_heap_stats(scope, metrics);
+    let stats = record_heap_stats(scope, metrics);
     let (used, limit) = heap_usage(&stats);
     if heap_fraction_at_or_above(used, limit, config.heap_retire_fraction) {
         Some((used, limit))
@@ -1342,17 +1486,31 @@ fn handle_main_worker_request(
             program,
             old_module_info,
             policy,
+            environment,
         } => handle_worker_request("update_database", reply_tx, || {
-            let res = instance_common.update_database(program, old_module_info, policy, inst);
+            let res = instance_common.update_database(program, old_module_info, policy, environment, inst);
             (res, false)
         }),
+        JsMainWorkerRequest::UpdateEnvironment { reply_tx, environment } => {
+            handle_worker_request("update_environment", reply_tx, || {
+                let res = instance_common.update_environment(environment, inst);
+                (res, false)
+            })
+        }
         JsMainWorkerRequest::CallReducer { reply_tx, params } => {
             handle_worker_request("call_reducer", reply_tx, || {
                 let mut call_reducer = |tx, params| instance_common.call_reducer_with_tx(tx, params, inst);
-                let (res, trapped) = call_reducer(None, params);
-                (res, trapped)
+                call_reducer(None, params)
             })
         }
+        JsMainWorkerRequest::CallIdcReducer {
+            reply_tx,
+            params,
+            delivery,
+            on_success,
+        } => handle_worker_request("call_idc_reducer", reply_tx, || {
+            instance_common.call_idc_reducer(params, delivery, inst, on_success)
+        }),
         JsMainWorkerRequest::CallReducerDetached { params, on_panic } => {
             handle_detached_worker_request("call_reducer", on_panic, || {
                 let mut call_reducer = |tx, params| instance_common.call_reducer_with_tx(tx, params, inst);
@@ -1362,11 +1520,13 @@ fn handle_main_worker_request(
         }
         JsMainWorkerRequest::ScheduledReducer { reply_tx, params } => {
             handle_worker_request("scheduled_reducer", reply_tx, || {
-                let (res, trapped) = instance_common
-                    .call_scheduled_function(params, inst)
-                    .now_or_never()
-                    .expect("our call_scheduled_function implementation is not actually async");
+                let (res, trapped) = instance_common.call_scheduled_reducer(params, inst);
                 (res, trapped)
+            })
+        }
+        JsMainWorkerRequest::RunIdcCallbackAndCleanup { reply_tx, msg } => {
+            handle_worker_request("run_idc_callback_and_cleanup", reply_tx, || {
+                instance_common.run_idc_callback_and_cleanup(msg, inst)
             })
         }
         JsMainWorkerRequest::CallView { reply_tx, cmd } => handle_worker_request("call_view", reply_tx, || {
@@ -1405,7 +1565,10 @@ fn handle_main_worker_request(
             caller_auth,
             caller_connection_id,
         } => handle_worker_request("call_identity_connected", reply_tx, || {
-            let call_reducer = |tx, params| instance_common.call_reducer_with_tx(tx, params, inst);
+            let call_reducer = |tx, params| {
+                let (res, trapped) = instance_common.call_reducer_with_tx(tx, params, inst);
+                (res.result, trapped)
+            };
             let mut trapped = false;
             let res = call_identity_connected(caller_auth, caller_connection_id, &info, call_reducer, &mut trapped);
             (res, trapped)
@@ -1415,7 +1578,10 @@ fn handle_main_worker_request(
             caller_identity,
             caller_connection_id,
         } => handle_worker_request("call_identity_disconnected", reply_tx, || {
-            let call_reducer = |tx, params| instance_common.call_reducer_with_tx(tx, params, inst);
+            let call_reducer = |tx, params| {
+                let (res, trapped) = instance_common.call_reducer_with_tx(tx, params, inst);
+                (res.result, trapped)
+            };
             let mut trapped = false;
             let res = ModuleHost::call_identity_disconnected_inner(
                 caller_identity,
@@ -1428,20 +1594,25 @@ fn handle_main_worker_request(
         }),
         JsMainWorkerRequest::DisconnectClient { reply_tx, client_id } => {
             handle_worker_request("disconnect_client", reply_tx, || {
-                let call_reducer = |tx, params| instance_common.call_reducer_with_tx(tx, params, inst);
+                let call_reducer = |tx, params| {
+                    let (res, trapped) = instance_common.call_reducer_with_tx(tx, params, inst);
+                    (res.result, trapped)
+                };
                 let mut trapped = false;
                 let res = ModuleHost::disconnect_client_inner(client_id, &info, call_reducer, &mut trapped);
                 (res, trapped)
             })
         }
-        JsMainWorkerRequest::InitDatabase { reply_tx, program } => {
-            handle_worker_request("init_database", reply_tx, || {
-                let call_reducer = |tx, params| instance_common.call_reducer_with_tx(tx, params, inst);
-                let (res, trapped): (Result<Option<ReducerCallResult>, anyhow::Error>, bool) =
-                    init_database(replica_ctx, &info.module_def, program, call_reducer);
-                (res, trapped)
-            })
-        }
+        JsMainWorkerRequest::InitDatabase {
+            reply_tx,
+            program,
+            environment,
+        } => handle_worker_request("init_database", reply_tx, || {
+            let call_reducer = |tx, params| instance_common.call_reducer_with_tx(tx, params, inst);
+            let (res, trapped): (Result<InitDatabaseResult, anyhow::Error>, bool) =
+                init_database(replica_ctx, &info.module_def, program, environment, call_reducer);
+            (res, trapped)
+        }),
     }
 }
 
@@ -1460,12 +1631,21 @@ fn handle_procedure_worker_request(
                 (res, trapped)
             })
         }
+        JsProcedureWorkerRequest::CallHttpHandler { reply_tx, params } => {
+            handle_worker_request("call_http_handler", reply_tx, || {
+                let (res, trapped) = instance_common
+                    .call_http_handler(params, inst)
+                    .now_or_never()
+                    .expect("our call_http_handler implementation is not actually async");
+                (res, trapped)
+            })
+        }
         JsProcedureWorkerRequest::ScheduledProcedure { reply_tx, params } => {
             handle_worker_request("scheduled_procedure", reply_tx, || {
                 let (res, trapped) = instance_common
-                    .call_scheduled_function(params, inst)
+                    .call_scheduled_procedure(params, inst)
                     .now_or_never()
-                    .expect("our call_scheduled_function implementation is not actually async");
+                    .expect("our call_scheduled_procedure implementation is not actually async");
                 (res, trapped)
             })
         }
@@ -1561,7 +1741,11 @@ where
                     Either::Left(module) => (module.replica_ctx(), module.scheduler()),
                     Either::Right(mcc) => (&mcc.replica_ctx, &mcc.scheduler),
                 };
-                let instance_env = InstanceEnv::new(replica_ctx.clone(), scheduler.clone());
+                let idc_sender = match &generation_module_or_mcc {
+                    Either::Left(module) => module.idc_sender(),
+                    Either::Right(mcc) => mcc.idc_sender.clone(),
+                };
+                let instance_env = InstanceEnv::new(replica_ctx.clone(), scheduler.clone(), idc_sender);
                 scope.set_slot(JsInstanceEnv::new(instance_env));
 
                 let startup_result = panic::catch_unwind(AssertUnwindSafe(|| {
@@ -1579,7 +1763,7 @@ where
                                 .send(Err(anyhow::anyhow!("JS worker panicked during startup")))
                                 .is_err()
                             {
-                                log::error!("startup result receiver disconnected");
+                                log::warn!("startup result receiver disconnected");
                             }
                         } else {
                             log::error!("JS worker panicked while recreating isolate");
@@ -1589,7 +1773,7 @@ where
                     Ok(Err(err)) => {
                         if let Some(result_tx) = startup_result_tx.take() {
                             if result_tx.send(Err(err)).is_err() {
-                                log::error!("startup result receiver disconnected");
+                                log::warn!("startup result receiver disconnected");
                             }
                         } else {
                             log::error!("failed to restart JS worker: {err:#}");
@@ -1597,12 +1781,15 @@ where
                         return;
                     }
                     Ok(Ok((crf, module_common))) => {
-                        env_on_isolate_unwrap(scope).set_module_def(module_common.info().module_def.clone());
+                        env_on_isolate_unwrap(scope).set_module_def(
+                            module_common.info().module_def.clone(),
+                            module_common.info().module_hash,
+                        );
 
                         if let Some(result_tx) = startup_result_tx.take()
                             && result_tx.send(Ok(module_common.clone())).is_err()
                         {
-                            log::error!("startup result receiver disconnected");
+                            log::warn!("startup result receiver disconnected");
                             return;
                         }
 
@@ -1625,9 +1812,11 @@ where
                 let info = &module_common.info();
                 let mut instance_common = InstanceCommon::new(&module_common);
                 let replica_ctx: &Arc<ReplicaContext> = module_common.replica_ctx();
-                let mut heap_metrics = worker_kind
-                    .checks_heap()
-                    .then(|| V8HeapMetrics::new(&info.database_identity));
+                let mut heap_metrics = V8HeapMetrics::new(
+                    &info.database_identity,
+                    worker_kind,
+                    replica_ctx.module_instance_memory_tracker.clone(),
+                );
 
                 let mut inst = V8Instance {
                     scope,
@@ -1639,9 +1828,7 @@ where
                         .with_label_values(&info.database_identity),
                     initial_heap_limit: heap_policy.heap_limit_bytes,
                 };
-                if let Some(heap_metrics) = heap_metrics.as_mut() {
-                    let _initial_heap_stats = sample_heap_stats(inst.scope, heap_metrics);
-                }
+                let _initial_heap_stats = record_heap_stats(inst.scope, &mut heap_metrics);
 
                 // Process requests to the worker.
                 //
@@ -1655,9 +1842,7 @@ where
                     let mut outcome =
                         W::handle_request(request, &mut instance_common, &mut inst, &module_common, replica_ctx);
 
-                    if let WorkerRequestOutcome::Continue = outcome
-                        && let Some(heap_metrics) = heap_metrics.as_mut()
-                    {
+                    if let WorkerRequestOutcome::Continue = outcome {
                         let request_check_due = heap_policy.heap_check_request_interval.is_some_and(|interval| {
                             requests_since_heap_check += 1;
                             requests_since_heap_check >= interval
@@ -1669,7 +1854,7 @@ where
                             requests_since_heap_check = 0;
                             last_heap_check_at = Instant::now();
                             if let Some((used, limit)) =
-                                should_retire_worker_for_heap(inst.scope, heap_metrics, heap_policy)
+                                should_retire_worker_for_heap(inst.scope, &mut heap_metrics, heap_policy)
                             {
                                 outcome = outcome.recreate_instance();
                                 log::warn!(
@@ -1803,8 +1988,8 @@ impl WasmInstance for V8Instance<'_, '_, '_> {
         self.scope.get_slot::<JsInstanceEnv>().unwrap().instance_env.tx.clone()
     }
 
-    fn set_module_def(&mut self, module_def: Arc<ModuleDef>) {
-        env_on_isolate_unwrap(self.scope).set_module_def(module_def);
+    fn set_module_def(&mut self, module_def: Arc<ModuleDef>, module_hash: spacetimedb_lib::Hash) {
+        env_on_isolate_unwrap(self.scope).set_module_def(module_def, module_hash);
     }
 
     fn call_reducer(&mut self, op: ReducerOp<'_>, budget: FunctionBudget) -> ReducerExecuteResult {
@@ -1848,6 +2033,23 @@ impl WasmInstance for V8Instance<'_, '_, '_> {
             .instance_env
             .take_procedure_tx_offset();
         (result, tx_offset)
+    }
+
+    async fn call_http_handler(
+        &mut self,
+        op: HttpHandlerOp,
+        budget: FunctionBudget,
+    ) -> (HttpHandlerExecuteResult, Option<TransactionOffset>) {
+        let result = common_call(self, budget, op, |scope, hooks, op| {
+            call_call_http_handler(scope, hooks, op)
+        })
+        .map_result(|call_result| {
+            call_result.map_err(|e| match e {
+                ExecutionError::User(e) => anyhow::Error::msg(e),
+                ExecutionError::Recoverable(e) | ExecutionError::Trap(e) => e,
+            })
+        });
+        (result, None)
     }
 }
 
@@ -1952,27 +2154,23 @@ where
         let timings = env.finish_funcall();
 
         // Derive energy stats.
-        let energy = energy_from_elapsed(budget, timings.total_duration);
-
-        // Reuse the last periodic heap sample instead of querying V8 on every call.
-        // We use this statistic for energy tracking, so eventual consistency is fine.
-        let memory_allocation = env.cached_used_heap_size();
+        let energy_used = FunctionBudget::from_duration(timings.total_duration)
+            // The magnitude that `total_duration` would have to have to cause an overflow here is
+            // large enough that we don't really have to worry about it (see `from_duration` docs).
+            // Still, better to saturate than wrap.
+            .unwrap_or(FunctionBudget::MAX);
+        let energy = EnergyStats::from_used(budget, energy_used);
 
         if heap_limit_hit.get() > 1 {
             let database_identity = *env.instance_env.database_identity();
             tracing::warn!(
                 %database_identity,
-                used_heap_size = memory_allocation,
                 current_heap_limit = scope.get_heap_statistics().heap_size_limit(),
                 "Module hit heap limit multiple times in single call, even after doubling!",
             )
         }
 
-        let stats = ExecutionStats {
-            energy,
-            timings,
-            memory_allocation,
-        };
+        let stats = ExecutionStats { energy, timings };
         ExecutionResult { stats, call_result }
     })
 }
