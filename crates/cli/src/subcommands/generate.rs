@@ -840,7 +840,6 @@ pub async fn run_prepared_generate_configs(
                 }
             };
             generate(&module, gen_lang, &options)
->>>>>>> upstream/master
         };
 
         fs::create_dir_all(&run.out_dir)?;
